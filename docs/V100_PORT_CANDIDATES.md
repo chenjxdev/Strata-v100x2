@@ -113,3 +113,19 @@ fork 里 P1 那批开关在本仓库的引用数：
 - 本仓库与官方引擎持平（prefill +1%，32K decode 略高但样本小）——**换引擎本身没有变快，价值在于代码已跟上 0.1.59.1 并带上了 sm_70 表**。
 
 启动脚本 `/data/models/strata-chenjx-q4` 的默认值按此定版：档 A 开、档 B 全关，每个档 B 开关仍可用环境变量单独打开做实验。
+
+---
+
+## all-cards split engine（paskaa 路线）：硬件可行，**模型不支持**
+
+- 构建：`-DSTRATA_BUILD_SPLIT=ON -DSTRATA_SPLIT_CARDS=2 -DSTRATA_SPLIT_ARCH=70` 在本机通过，产物 `build-split/src/split/strata-split-2`（19 MB）。
+- 试跑（131072 ctx，`FNX_EXPERT_RAM_GIB=3 FNX_KV8=0`，两卡空闲）：
+
+```
+gguf: 216 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
+ERR the all-cards split engine does not read this model's routed experts
+    (blk.0.ffn_down_exps.weight is ggml type 6); use the normal layer split
+```
+
+- 结论：**这条路被模型格式卡住，不是被 16 GB 显存卡住**。当前 `UD-IQ4_XS-abliterated` 的 routed experts 是 type 6，sfnx 不支持；paskaa 的 +57% 是在 Q4_K_XL / QAD NVFP4 权重上测的。要走这条路需要换一份 sfnx 支持的量化权重（或重新量化），本机现有权重不行。
+- 因此这条路线在"不换模型"的前提下**关闭**，不再投入。
