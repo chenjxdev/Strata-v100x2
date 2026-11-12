@@ -140,6 +140,8 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
 /// Y FP32 (ldy).  FP16 tensor cores, FP32 sums.  false: not launched (shape or type not covered).  CUDA only.
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream);
+/// Whether gemm_iq_f16_grouped takes a Q5_0 matrix (K a multiple of 128): only its STRATA_PF_WMMA2 tile has a Q5_0 body.
+bool gemm_iq_f16_grouped_q5_0();
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
 

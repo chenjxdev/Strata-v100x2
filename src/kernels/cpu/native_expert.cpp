@@ -193,11 +193,11 @@ bool iq512f_ok(int type) {
     return ok;
 }
 
-bool q50_512_ok() {
-    static const bool ok = [] {
+bool q50_ok(bool wide) {
+    auto check = [wide] {
         const ggml_type_traits_cpu* tr = traits(GGML_TYPE_Q5_0);
         const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_0);
-        if (!cpu_vnni_ok() || tr == nullptr || tr->vec_dot == nullptr || t8 == nullptr || t8->from_float == nullptr) return false;
+        if (!(wide ? cpu_vnni_ok() : cpu_avx2_ok()) || tr == nullptr || tr->vec_dot == nullptr || t8 == nullptr || t8->from_float == nullptr) return false;
         uint32_t seed = 31337u;
         auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
         for (const int n : {96, 640}) {
@@ -218,18 +218,23 @@ bool q50_512_ok() {
             std::vector<float> got((size_t) nt * rows), want((size_t) nt * rows);
             float* gp[nt];
             for (int t = 0; t < nt; ++t) gp[t] = &got[(size_t) t * rows];
-            q50_512_down_rows(w.data(), rb, n, hp, nt, gp, 0, rows);
+            if (wide) q50_512_down_rows(w.data(), rb, n, hp, nt, gp, 0, rows);
+            else q50_256_down_rows(w.data(), rb, n, hp, nt, gp, 0, rows);
             for (int r = 0; r < rows; ++r)
                 for (int t = 0; t < nt; ++t) tr->vec_dot(n, &want[(size_t) t * rows + r], 0, w.data() + (size_t) r * rb, 0, hp[t], 0, 1);
             if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) {
-                std::fprintf(stderr, "strata: the 512-bit Q5_0 down rows differ from this ggml-cpu's dot: not used\n");
+                std::fprintf(stderr, "strata: the %s Q5_0 down rows differ from this ggml-cpu's dot: not used\n", wide ? "512-bit" : "AVX-2");
                 return false;
             }
         }
         return true;
-    }();
+    };
+    if (wide) { static const bool ok = check(); return ok; }
+    static const bool ok = check();
     return ok;
 }
+bool q50_512_ok() { return q50_ok(true); }
+bool q50_256_ok() { return q50_ok(false); }
 
 void init_once() {
     static std::once_flag once;
@@ -658,6 +663,13 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     static const int q50_min = [] { const char* e = std::getenv("STRATA_Q50_512_MIN"); return e ? std::atoi(e) : 2; }();
     if (q50_512 && f.d_type == 6 && nt >= q50_min && f.tail_off == 0 && q50_512_ok()) {
         q50_512_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    // Without AVX-512: Q5_0 down rows in 256-bit lanes, ggml-cpu's AVX2 dot for each token bit for bit (q50_256_ok), the weights decoded
+    // once for the window's tokens.  STRATA_NO_Q50_256=1 keeps ggml's dot.
+    static const bool q50_256 = !cpu_vnni_ok() && cpu_avx2_ok() && std::getenv("STRATA_NO_Q50_256") == nullptr;
+    if (q50_256 && f.d_type == 6 && nt >= 2 && f.tail_off == 0 && q50_256_ok()) {
+        q50_256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows

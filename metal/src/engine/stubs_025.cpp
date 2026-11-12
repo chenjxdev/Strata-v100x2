@@ -29,5 +29,8 @@ void iq512_reference_gu_rows(int, const uint8_t*, size_t, size_t, int, const voi
 void q50_512_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     strata::metal_engine::missing("strata::kernels::cpu::q50_512_down_rows");
 }
+void q50_256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    strata::metal_engine::missing("strata::kernels::cpu::q50_256_down_rows");
+}
 
 }  // namespace strata::kernels::cpu

@@ -151,7 +151,11 @@ option(STRATA_Q6K_EXPERTS "Build the Q6_K gate/up grouped expert kernels (UD-Q6_
 if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
-option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# ON in this V100 tree: Unsloth UD-IQ4_XS keeps Q5_0 down experts in 30 of its 48 layers, and without this instance
+# those layers leave MMQ for the FP16 prompt path (each expert dequantized to FP16, then one cuBLAS GEMM per expert).
+# Measured on 2x V100-SXM2-16G (docs/V100_PORT_CANDIDATES.md): the prompt GPU time per 8192-token chunk -31%, prompt
+# tok/s +5-10% at 14K-61K (the stream over PCIe becomes the limit), 2 expert-cache slots fewer per card.
+option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance (OrcaRouter Q4_K_S, UD-IQ4_XS down experts)" ON)
 # CUDA: the pointer-table MMQ behind STRATA_MMQ_DIRECT=1 (the prompt path's MMQ reads resident experts in their cache
 # slots through a Strata-side copy of llama.cpp's MMQ scheduler, src/prefill/moe_mmq_tab.cuh).  Off by default, like
 # the K-quant options above: the engine loads every kernel when it starts (CUDA_MODULE_LOADING=EAGER), and these nine
@@ -461,6 +465,13 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   add_test(NAME nvfp4_cpu_parity COMMAND nvfp4_avx512_parity)   # random blocks; the AVX2 rows bit-equal to ggml's
   set_tests_properties(nvfp4_cpu_parity PROPERTIES TIMEOUT 120)
+  # the AVX-2 Q5_0 down rows vs ggml-cpu's vec_dot, bit for bit, and their speed (CPU only)
+  if(NOT STRATA_ISA_FLOOR)
+    add_executable(q50_avx2_parity src/kernels/cpu/q50_avx2_parity.cpp)
+    target_link_libraries(q50_avx2_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q50_avx2_parity COMMAND q50_avx2_parity)
+    set_tests_properties(q50_avx2_parity PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endif()
   if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
     target_link_libraries(nvfp4_expert_gpu_parity PRIVATE strata_kernels ggml-base CUDA::cudart)

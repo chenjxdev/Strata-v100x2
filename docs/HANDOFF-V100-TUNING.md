@@ -183,4 +183,4 @@ STRATA_ARGMAX_ROWS_SM70=1              # 单 block 贪心 pick（仅并列 logit
 - 服务器时间 UTC；`date -u` 打日志名。
 - `github.com` 直连时通时不通；机器上有全局 `url.insteadOf` 把 github.com 改写到 `gh-proxy.com`，push 会被凭据域不匹配挡住（临时 `git config --global --unset` 后再 push，用完恢复）。
 - 8080 只能跑一个实例；`--engine strata` 的 serve 与 sfnx 不同进程模型。
-- 构建：`cmake -S . -B build-v100 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`，增量 `cmake --build build-v100 -j18`（全量约 15–20 分钟）。
+- 构建：`cmake -S . -B build-v100 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`（`STRATA_ORCA_Q4KS_MMQ` 现在默认 ON：Q5_0 down 进 MMQ，见 `V100_PORT_CANDIDATES.md`），增量 `cmake --build build-v100 -j18`（全量约 15–20 分钟）。

@@ -156,6 +156,9 @@ void iq4nl256_down_rows_v(int, const uint8_t*, size_t, int, const void* const*, 
 void iq4nl256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 IQ4_NL kernel");
 }
+void q50_256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 Q5_0 down kernel");
+}
 void q8k_quant_avx2(const float*, void*, int64_t) { unsupported("the AVX-2 Q8_K quantizer"); }
 void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 k-quant kernel");

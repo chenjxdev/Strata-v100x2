@@ -6836,16 +6836,17 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
 #endif
 }
 
-// ---- STRATA_PF_WMMA2=1 (opt-in): IQ2_S gate/up and IQ4_NL down, tiled like a Volta MoE kernel in the
+// ---- STRATA_PF_WMMA2=1 (opt-in): IQ2_S gate/up and IQ4_NL / Q5_0 down, tiled like a Volta MoE kernel in the
 // PR author's own unpublished llama.cpp patches.
 // A block: W2_RB = 128 weight rows of one expert x W2_CB = 64 of its sorted rows, K stages of W2_KT = 64. Thread t dequantizes
 // row t % 128, 32-value sub-block t / 128 of each K stage from the raw stage in shared memory (one IQ2_S super-block or four IQ4_NL
-// blocks per row, read by the whole block as 4-byte words, the next one already in registers). 8 warps = 4 (32 weight rows) x 2
+// or Q5_0 blocks per row, read by the whole block as 4-byte words, the next one already in registers). 8 warps = 4 (32 weight rows) x 2
 // (32 sorted rows), 2 x 2 wmma 16x16x16 fragments each, FP32 sums.
 constexpr int W2_RB = 128, W2_CB = 64, W2_KT = 64, W2_NT = 256, W2_LD = W2_KT + 8;
 template <int TY> struct w2_traits;
 template <> struct w2_traits<22> { static constexpr int raw_k = 256, raw_b = 82, segw = 21, segw_s = 21, ntab = 1024 + 16; };
 template <> struct w2_traits<20> { static constexpr int raw_k = 128, raw_b = 72, segw = 18, segw_s = 19, ntab = 128; };
+template <> struct w2_traits<6> { static constexpr int raw_k = 128, raw_b = 88, segw = 22, segw_s = 23, ntab = 1; };
 template <int TY> __host__ __device__ constexpr int w2_nl() { return (W2_RB * w2_traits<TY>::segw + W2_NT - 1) / W2_NT; }
 
 __device__ __forceinline__ uint32_t w2_ld_b2(const uint8_t* p) {   // 4 bytes at a 2-byte aligned address
@@ -6920,6 +6921,33 @@ __device__ __forceinline__ void w2_dq_iq4_nl(const uint8_t* b, __half* o, const 
     }
 }
 
+// Q5_0 block at b (d, qh, qs) -> 32 halves at o, natural order: value j = low nibble of qs[j] | bit j of qh << 4, value j + 16 =
+// high nibble | bit j + 16 << 4, minus 16.  1024 + q is the half with mantissa q, so (that - 1040) is the exact small integer and
+// the one rounding is d times it, as cvt<__half>(d * (q - 16))
+__device__ __forceinline__ void w2_dq_q5_0(const uint8_t* b, __half* o) {
+    const half2 d2 = __half2half2(__ushort_as_half(*reinterpret_cast<const uint16_t*>(b)));
+    const half2 bias = __half2half2(__ushort_as_half((uint16_t) 0x6410));   // 1040
+    const uint32_t qh = w2_ld_b2(b + 2);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t q = w2_ld_b2(b + 6 + 4 * i);
+        const uint32_t hl = qh >> (4 * i), hh = qh >> (4 * i + 16);
+        uint32_t lo[4], hi[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            lo[k] = 0x6400u | ((q >> (8 * k)) & 0xfu) | (((hl >> k) & 1u) << 4);
+            hi[k] = 0x6400u | ((q >> (8 * k + 4)) & 0xfu) | (((hh >> k) & 1u) << 4);
+        }
+        uint2 L, H;
+        L.x = w2_u32(__hmul2(__hsub2(w2_h2(lo[0] | lo[1] << 16), bias), d2));
+        L.y = w2_u32(__hmul2(__hsub2(w2_h2(lo[2] | lo[3] << 16), bias), d2));
+        H.x = w2_u32(__hmul2(__hsub2(w2_h2(hi[0] | hi[1] << 16), bias), d2));
+        H.y = w2_u32(__hmul2(__hsub2(w2_h2(hi[2] | hi[3] << 16), bias), d2));
+        *reinterpret_cast<uint2*>(o + 4 * i) = L;
+        *reinterpret_cast<uint2*>(o + 16 + 4 * i) = H;
+    }
+}
+
 template <int TY>
 __global__ void __launch_bounds__(W2_NT, 2) gemm_iq_f16_w2_kernel(const uint8_t* __restrict__ W, size_t expert_bytes, size_t row_bytes,
                                                                   int K, const __half* __restrict__ X, int ldx,
@@ -6956,7 +6984,8 @@ __global__ void __launch_bounds__(W2_NT, 2) gemm_iq_f16_w2_kernel(const uint8_t*
         }
     };
     load_y(0);
-    if constexpr (TY == 20) {
+    if constexpr (TY == 6) {
+    } else if constexpr (TY == 20) {
         reinterpret_cast<half2*>(tab)[tid] = __halves2half2(__int2half_rn(kvalues_iq4nl[tid & 15]), __int2half_rn(kvalues_iq4nl[tid >> 4]));
     } else {
         for (int i = tid; i < 1024; i += W2_NT) tab[i] = reinterpret_cast<const uint2*>(iq2s_grid)[i];
@@ -6981,7 +7010,8 @@ __global__ void __launch_bounds__(W2_NT, 2) gemm_iq_f16_w2_kernel(const uint8_t*
 #pragma unroll
         for (int h = 0; h < NSUB; ++h) {
             const int k0 = (rs * NSUB + h) * W2_KT;
-            if constexpr (TY == 20) w2_dq_iq4_nl(rr + 18 * (2 * h + sub), xrow, reinterpret_cast<const half2*>(tab));
+            if constexpr (TY == 6) w2_dq_q5_0(rr + 22 * (2 * h + sub), xrow);
+            else if constexpr (TY == 20) w2_dq_iq4_nl(rr + 18 * (2 * h + sub), xrow, reinterpret_cast<const half2*>(tab));
             else w2_dq_iq2_s(rr, 2 * h + sub, xrow, tab);
 #pragma unroll
             for (int u = 0; u < 2; ++u) *reinterpret_cast<uint4*>(ys + (yc + 32 * u) * W2_LD + 8 * yq) = Yr[u];
@@ -7041,6 +7071,8 @@ bool w2_on() {
 }
 }  // namespace
 
+bool gemm_iq_f16_grouped_q5_0() { return w2_on(); }
+
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream) {
     if (n_out % WG_BN != 0 || n_experts <= 0 || max_rows <= 0 || ldy % 4 != 0) return false;
@@ -7050,9 +7082,9 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
             major < 7)
             return false;
     }
-    // STRATA_PF_WMMA2=1 (opt-in): IQ2_S gate/up and IQ4_NL down through gemm_iq_f16_w2_kernel (above)
+    // STRATA_PF_WMMA2=1 (opt-in): IQ2_S gate/up and IQ4_NL / Q5_0 down through gemm_iq_f16_w2_kernel (above)
     if (w2_on() && n_out % W2_RB == 0 && ldx % 8 == 0 && ldy % 8 == 0 && (uintptr_t) X % 16 == 0 && (uintptr_t) Y % 32 == 0 &&
-        (uintptr_t) W % 4 == 0 && expert_bytes % 4 == 0 && ((ty == 22 && K % 512 == 0) || (ty == 20 && K % 128 == 0))) {
+        (uintptr_t) W % 4 == 0 && expert_bytes % 4 == 0 && ((ty == 22 && K % 512 == 0) || ((ty == 20 || ty == 6) && K % 128 == 0))) {
         const size_t rb = iq_row_bytes(ty, K);
         const int ch = (max_rows + W2_CB - 1) / W2_CB;
         if (rb % 4 == 0 && (long long) n_experts * ch <= 65535) {
@@ -7060,6 +7092,8 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
             cudaStream_t s2 = (cudaStream_t) stream;
             if (ty == 22)
                 gemm_iq_f16_w2_kernel<22><<<grid2, W2_NT, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, ch, Y, ldy);
+            else if (ty == 6)
+                gemm_iq_f16_w2_kernel<6><<<grid2, W2_NT, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, ch, Y, ldy);
             else
                 gemm_iq_f16_w2_kernel<20><<<grid2, W2_NT, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, ch, Y, ldy);
             return cudaGetLastError() == cudaSuccess;

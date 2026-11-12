@@ -56,6 +56,11 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1);
 
+/// out[t][r] = w_r . h[t] for Q5_0 (type 6) rows against Q8_0 activations: ggml-cpu's AVX2 dot for each token, bit for bit
+/// (the caller checks that against the linked ggml), the weights decoded once per block for all nt tokens.
+void q50_256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
+                       float* const* out, int r0, int r1);
+
 // Singleton-equivalent IQ4_NL down rows; caller checks the linked ggml AVX2/FMA path.
 void iq4nl_reference_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq,
                           int nt, float* const* out, int r0, int r1);
