@@ -90,3 +90,26 @@ fork 里 P1 那批开关在本仓库的引用数：
 1. **parity 测试**（`-DSTRATA_BUILD_TESTS=ON` 构建）：`native_expert_parity`、`mmvq_il_parity`、`gr_parity`、`qsa_merge_daily_parity`、`b6_mmvq_bench`、`qsa_rows_bench`、`expdec_bench` —— 全部要求 memcmp 相同。
 2. **端到端 token 对比**：同一 prompt、`temperature 0`、`max_tokens` 固定，分别在 `STRATA_SM70_PERF=0` 与 `=1` 下各跑一次，逐 token 比对；档 B 的开关单独再比一轮，差异只应出现在浮点舍入可解释的位置。
 3. **速度**：每轮重启引擎，取中位数，至少 3 个 prompt 长度（2K / 8K / 32K）。
+
+---
+
+## 本机实测（2026-11-12，2×V100-SXM2-16G，IQ4_XS，split 25，262144 ctx）
+
+同一组固定 prompt（约 2K / 8K / 32K token，T=0，每次唯一 nonce 避开前缀缓存）：
+
+| 配置 | prefill tok/s (2K / 8K / 32K) | decode tok/s (2K / 8K / 32K) |
+|---|---|---|
+| 官方 0.1.59（基线，同 config） | 812 / 1423 / 2044 | 44.4 / 54.5 / 57.7 |
+| 本仓库位 A（sm_70 表开，档 B 全关） | 821 / 1444 / 2066 | 42.1 / 55.3 / 62.2 |
+| 位 A + `PF_WMMA=1` | 836 / 1466 / 2097 | 40.7 / 63.1 / 80.4 |
+| 位 A + `SPLIT_OWN=1` | **734 / 1066 / 1154** | 37.8 / 52.6 / 60.0 |
+| 位 A 关（`STRATA_SM70_PERF=0`） | 820 / 1426 / 2045 | 39.1 / 53.8 / 62.5 |
+
+结论：
+
+- **sm_70 表在这台机器上只有 ~1%**（fork 在 2×V100-32G、IQ3_S、split 16 上测到 +11.4%）。bitwise 成立、无质量风险，但不要指望它带来明显提速。
+- **`STRATA_SPLIT_OWN=1` 在 16 GB 卡上是负收益**（prefill −26~−44%）：它给每个 stage 留 ~1904 MiB prompt buffer，专家缓存从 3612 槽掉到 3056 槽，而本机无 NVLink，缓存未命中的代价比省下的拷贝更贵。默认关。
+- **`PF_WMMA=1` 与基线持平**（prefill +1~2%，落在噪声内），且对 IQ4_XS 大概率走不到 tile 路径；它改变数值，故默认关。
+- 本仓库与官方引擎持平（prefill +1%，32K decode 略高但样本小）——**换引擎本身没有变快，价值在于代码已跟上 0.1.59.1 并带上了 sm_70 表**。
+
+启动脚本 `/data/models/strata-chenjx-q4` 的默认值按此定版：档 A 开、档 B 全关，每个档 B 开关仍可用环境变量单独打开做实验。
