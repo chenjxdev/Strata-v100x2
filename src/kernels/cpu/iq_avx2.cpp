@@ -29,6 +29,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -569,6 +570,69 @@ void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
     iq4nl256_down_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, hq, nt, out, r0, r1);
+}
+
+// Q5_0 down rows: ggml-cpu's AVX2 ggml_vec_dot_q5_0_q8_0 for every token, with the block's weights (nibbles, fifth bit,
+// |q|) decoded once for all of them.  Per token the same operations in the same order - the d_x * d_y product, the
+// maddubs / madd integer sums, one FMA a block into an 8-lane accumulator, ggml's hsum_float_8 - so the same bits.
+namespace {
+namespace q50_256 {
+
+inline float h2f(uint16_t x) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x))); }
+inline float hsum(__m256 x) {   // ggml's hsum_float_8
+    __m128 s = _mm256_extractf128_ps(x, 1);
+    s = _mm_add_ps(s, _mm256_castps256_ps128(x));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+template <int NT>
+void rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out, int r0, int r1) {
+    const __m256i low = _mm256_set1_epi8(0xF), hi = _mm256_set1_epi8((char) 0xF0), ones = _mm256_set1_epi16(1);
+    const __m256i shuf = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
+    const __m256i bitm = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe), all = _mm256_set1_epi64x(-1);
+    const int nb = n / QK5_0;
+    for (int r = r0; r < r1; ++r) {
+        const block_q5_0* x = (const block_q5_0*) (w + (size_t) r * row_bytes);
+        __m256 acc[NT];
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int ib = 0; ib < nb; ++ib) {
+            const float dx = h2f(x[ib].d);
+            const __m128i q4 = _mm_loadu_si128((const __m128i*) x[ib].qs);
+            __m256i qx = _mm256_and_si256(low, _mm256_insertf128_si256(_mm256_castsi128_si256(q4), _mm_srli_epi16(q4, 4), 1));
+            uint32_t qh;
+            std::memcpy(&qh, x[ib].qh, 4);
+            const __m256i bits = _mm256_cmpeq_epi8(_mm256_or_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) qh), shuf), bitm), all);
+            qx = _mm256_or_si256(qx, _mm256_andnot_si256(bits, hi));
+            const __m256i ax = _mm256_sign_epi8(qx, qx);
+            for (int t = 0; t < NT; ++t) {
+                const block_q8_0* yb = y[t] + ib;
+                const __m256i sy = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) yb->qs), qx);
+                const __m256 q = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, _mm256_maddubs_epi16(ax, sy)));
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * h2f(yb->d)), q, acc[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = hsum(acc[t]);
+    }
+}
+
+}  // namespace q50_256
+}  // namespace
+
+void q50_256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
+                       int r0, int r1) {
+    for (int at = 0; at < nt;) {
+        const int k = std::min(nt - at, 4);   // 4 accumulators: with the decoded block and the constants, 16 registers
+        const block_q8_0* y[4];
+        for (int t = 0; t < k; ++t) y[t] = (const block_q8_0*) hq[at + t];
+        switch (k) {
+            case 1: q50_256::rows<1>(w, row_bytes, n, y, out + at, r0, r1); break;
+            case 2: q50_256::rows<2>(w, row_bytes, n, y, out + at, r0, r1); break;
+            case 3: q50_256::rows<3>(w, row_bytes, n, y, out + at, r0, r1); break;
+            default: q50_256::rows<4>(w, row_bytes, n, y, out + at, r0, r1); break;
+        }
+        at += k;
+    }
 }
 
 
