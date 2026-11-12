@@ -50,6 +50,43 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_FUSE_DECODE", "1"},         // -1.3
             {"STRATA_GR_UP75", "1"},             // -1.2
         };
+    } else if (mj == 7 && mn == 0) {
+        // Volta (Tesla V100 / Titan V).  Taken from the V100 fork's measured table, then re-reviewed
+        // switch by switch against this tree (docs/V100_PORT_CANDIDATES.md, P0-1).  The fork measured
+        // 2x V100 16 GB, IQ3_S, layer split 16, --pipeline-windows 2, A/B/A/B/A/B, a restart before
+        // every measured request: 83.1 vs 74.6 tok/s median (+11.4%).
+        //
+        // This table must not change the tokens: every entry either says "bitwise"/"same bits" in the
+        // kernel's own comment here, or is a layout/launch change whose parity test exists in
+        // src/kernels (mmvq_il_parity, gr_parity, native_expert_parity, qsa_merge_daily_parity,
+        // expdec_bench).  Run those on this machine before trusting a speed number.
+        //
+        // Left out on purpose, with the reason:
+        //   STRATA_PF_WMMA2         acts only inside the opt-in STRATA_PF_WMMA=1 prompt path; alone it
+        //                           does nothing, so the run config opts into both or neither.
+        //   STRATA_GR_DOWN_TG=1     on Volta down_tg() would force one token per block, the variant
+        //                           fused_gr.cu's benchmark found slower at every T.
+        //   STRATA_ADAPT_OVERLAP    the fork's own note: the implicit copy budget can change cache
+        //                           residency, so it is not token-identical; opt in from the config.
+        //   STRATA_ARGMAX_ROWS_SM70 the one-block greedy pick: the same id unless two logits tie, and
+        //                           the tie-break order of the two kernels is not documented, so it
+        //                           stays out of a table that must not change tokens; opt-in.
+        // This table is new in this tree, so STRATA_DEFAULTS=026 (the master switch for everything up
+        // to 0.2.6) leaves it out, like the sm_121 table below.
+        if (off("STRATA_SM70_PERF") || defaults026) return t;
+        t = {
+            {"STRATA_SM70_TABLE", "1"},        // Volta master switch: interleaved dense table, expert mode 8, hidden HC up
+            {"STRATA_DEQUANT_WIDE", "1"},      // wide vector stores for native weights (same expression on the same operands)
+            {"STRATA_SIDE_MIXER", "2"},        // the mixer's input-only work on branch streams (bitwise the same outputs)
+            {"STRATA_GR_UP75", "1"},           // up projection, rows 4 to a uint4 (the same bits as gr_up_multi_kernel)
+            {"STRATA_B6_MMVQ_ROWS", "1"},      // the b6 MMVQ row layout (bit for bit against the exact layout)
+            {"STRATA_GU_SWIGLU", "1"},         // gate/up + SwiGLU + q8_1 in one launch (every value the separate kernels')
+            {"STRATA_QSA_ROWS", "1"},          // block_scores_rows_kernel (scores and ids bit for bit)
+            {"STRATA_ATTN_DAILY", "1"},        // the pre-sm75 chunk + merge kernels (the parity harness compares bitwise)
+            {"STRATA_GR_NORM_FAST", "1"},      // the split norm in registers (rs and xn bitwise the same)
+            {"STRATA_QIL", "1"},               // quantize + interleave in one launch (the same bytes)
+            {"STRATA_EXPDEC", "1"},            // the group's activations in shared memory for expert apply (bitwise the same)
+        };
     } else if (mj == 12 && mn == 1) {
         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
