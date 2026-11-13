@@ -188,3 +188,9 @@ nsys：decode 时 GPU 20% 时间在 `wait_flag_ge_kernel`。`perf record`（3.2K
 | `--kv-resident` 下调 | 未测：32768 cell 在 VRAM 里总共只占 ≈0.2 GiB（1.55 GiB 是 229376 cell 的 RAM 部分），降到 8192 最多多 ≈75 槽（≈1%） |
 
 `STRATA_SPLIT_MTP_BATCH=1`（末卡分批填草稿层的 prompt K/V）：prompt 61K 2149 / 2155 vs ≈2090（+3%），但 decode 14K 均值 72.6（4 次）vs 77.1（7 次）、61K 67.0 vs 69.7，约 −4~6%（草稿变差、接受率降）。只影响草稿、不影响验证后的输出，但 decode 更重要，**不开**。
+
+## 补充说明（2026-11-13）
+
+- **更正本文开头“11 个开关每一条都有 bitwise / parity 依据”**：10 项的注释写逐位一致，但 parity 测试没在这台 V100 上跑过；`STRATA_SM70_TABLE`（expert mode 8、交错稠密表、hidden HC up）原作者写明“要在 V100 上确认后才默认开”（`iq_kernels.cu:6186`、`native_mmvq.cu:3930`），本仓库没有补过确认。生产配置目前设 `STRATA_SM70_TABLE=0`，用户确认该配置质量正常。
+- 官方 0.1.55 / 0.1.57 / 0.1.59 的 cuda12 二进制同样是 `STRATA_EXPERIMENTAL_SM60=ON` 构建，V100 专属内核与本仓库相同。
+- 后续提速方向（专家 profile 重建、`STRATA_STAGE_TRIM` 的 Xid 31、PF_WMMA 复评等）见 `docs/HANDOFF-V100-TUNING.md` 第 5 节。
