@@ -146,6 +146,8 @@ namespace strata::prefill { void gr_write_cvec_norm_rs(float* p0, float const* p
 namespace strata::prefill { void gr_write_norm_rs(float* p0, float const* p1, float const* p2, long long p3, float const* p4, float p5, float* p6, unsigned short* p7, long long p8, void* p9, unsigned short* p10, long long p11, bool p12) { strata::metal_engine::missing("strata::prefill::gr_write_norm_rs"); } }
 // pf_wmma (STRATA_PF_WMMA=1, Volta prompt experts) is CUDA only; the prefill code of 148/149 references it, so the Metal link needs the entry point. Off on Metal: "not launched".
 namespace strata::kernels { bool gemm_iq_f16_grouped(int p0, void const* p1, unsigned long p2, int p3, int p4, void const* p5, int p6, int const* p7, int p8, int p9, float* p10, int p11, void* p12) { return false; } }
+// the Q5_0 probe of pf_wmma's WMMA2 tile (gemm_iq_f16_grouped_q5_0, prefill.cpp): CUDA only; off on Metal, no Q5_0 tiles
+namespace strata::kernels { bool gemm_iq_f16_grouped_q5_0() { return false; } }
 // STRATA_Q8_SM60 (Pascal GP100, opt-in): a no-op on Metal; NativeHead::load()/unload() call these for a Q8_0 head, so they must exist and answer "nothing packed".
 namespace strata::kernels { bool native_q8_0_sm60_pack(void const* p0, int p1, int p2, char const* p3) { return false; } }
 namespace strata::kernels { void native_q8_0_sm60_release(void const* p0) { } }
