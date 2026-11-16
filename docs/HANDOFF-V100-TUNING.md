@@ -72,7 +72,7 @@ nvidia-smi --query-gpu=index,memory.used,power.draw,power.limit --format=csv
 
 - `args`：`--layer-split 25`、`gpu=[1,0]`、`--max-context 262144`、`--kv int8`、`--kv-resident 32768`、`--pipeline-windows 2`、`--vram-reserve-mib/-later-mib 512/512`、`--spec 4 --spec-min-p 0.6`、`--mtp /data/models/mtp/rt`、`--suffix-draft 6`、`--pcie-frac 0.20`、`--pool-workers 14`、`--expert-cache auto`、`--expert-profile terminal/0.1.49.2/data/expert-profile.bin`、`--vision`。
 - `env`：`STRATA_SM70_TABLE=0`、`STRATA_STAGE_TRIM=1`、`STRATA_PREFILL_CPU_SHARE=auto`、`STRATA_PREFILL_CPU_SHARE_MAX=6144`、`STRATA_PREFILL_STREAM_MIN=6144`、`STRATA_HC_Q8=0`、`STRATA_ROUTE_TAIL_SKIP=0`、`STRATA_AUX_CPUS=auto`、`STRATA_EMB_REUSE_ACCOUNT=1`、`STRATA_KV_GROW=1`、`STRATA_WATCHDOG_S=300`。
-- `STRATA_PF_WMMA` / `PF_WMMA2` 目前**没开**（11-12 开过，后来撤掉）。
+- `STRATA_PF_WMMA=1` / `STRATA_PF_WMMA2=1` **已启用**（2026-11-15 重评后入生产，见 §5.3；回退备份 `.bak-before-pfwmma2-20261115-132119`）。
 - **质量否决（用户实测反馈，2026-11-15）**：`STRATA_SM70_TABLE=1` 实测智商下降，后续不再考虑整表或相关组合开关；保持 `STRATA_SM70_TABLE=0`，不得作为性能候选重试。
 - 日志确认 sm_70 默认表开了 10 项（`SM70_TABLE` 被配置关掉）。
 - trim 前备份：`strata-chenjx-q4.json.bak-before-stage-trim-20261113-045640`；更早备份：`.bak-before-pfwmma-20261112-130109`、`.bak-nsys`、`.bak-pcie`。**改配置前先备份。**
@@ -148,11 +148,15 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 - 数值影响：只改变权重驻留位置和缓存容量；缓存变大带来的 GPU/CPU 专家舍入差别同 5.1。实测数据见第 7 节。
 - 11-13 已在 trim 上单独 A/B `STRATA_HC_Q8=1`：日志确认每 stage 使用 0.30–0.33 GiB 的原 GGUF Q8_0 HC，但 BF16 仍被其它路径保留，常驻专家从 **9,632 降为 9,294**。三轮 3.2K / 1,024-token 交替 decode **89.6 → 89.1（−0.56%，噪声内）**，无 CUDA/Xid；不采用，生产保持 `STRATA_HC_Q8=0`。
 
-### 5.3 重新评估 PF_WMMA / PF_WMMA2（prompt +3.5~5%）
+### 5.3 已采纳：PF_WMMA / PF_WMMA2（2026-11-15 重评入生产，prompt 14K/61K +4.2~4.5%）
 
 - 11-12 实测：`STRATA_PF_WMMA=1 STRATA_PF_WMMA2=1`（含今天加的 Q5_0 W2 tile）让 Q5_0 down 段 −46%，prompt 14K 1445 → 1515~1535、61K 2062 → 2134~2162 tok/s。
 - 代价：这些专家层的 prompt 激活改为 FP16（超过 65504 会被截断），与默认不逐位一致。11-12 同时撤掉了它和 `SM70_TABLE`，没法确认当时的担心是否和它有关。
 - 做法：单独打开它（不动 `SM70_TABLE`），跑第 6 节的回归集；没问题就保留。
+- **11-15 已按此完成并采纳**：3 轮 × 3.4K/14K/61K off/on 交替（512 token、每臂重启、同一生产二进制仅 env 差异；`~/tune/results.jsonl` 标签 `pfwbase-r*` / `pfwon-r*`，进度 `~/tune/pfw-ab.progress`）。prompt 中位：3.4K 900.3→901.7（+0.2%，噪声内）、14K 1518.8→1583.1（**+4.2%**，配对 +3.9/+4.6/+4.2 三轮同向）、61K 2141.9→2238.7（**+4.5%**，配对 +4.4/+4.9/+4.3 三轮同向）；decode 3.4K −0.1% / 14K +4.1% / 61K +0.4%，无退化。
+- 质量回归通过：182 工具返回结构化 `read_file {"path":"src/main.cpp"}` 与基线一致；4 短题 2 逐字相同 + 2 等价正确（同义改写/逻辑等价实现，属 GPU/CPU 专家舍入类既有差异）；2048 长输出无循环（`~/tune/q-pfwon*.json`）。
+- 机制确认：config `env` 由 serve/server.py 注入**引擎子进程**（python 父进程 environ 看不到，验证时别查错进程）；引擎进程 environ 含两变量=1。无 error/Xid/stall，VRAM 与命中率与 off 臂同级（LOW 告警为既有状况）。
+- 生产 11-15 13:22 UTC 重启生效，冒烟 14K 1562.5 / 61K 2238.2 tok/s，质量冒烟一致。回退 = 删 env 两行（备份见上）。`SM70_TABLE` 保持 0（质量否决不变）。
 
 ### 5.4 其他可试的旋钮（每个都要单独 A/B）
 
@@ -279,6 +283,8 @@ decode（3.2K/14K，1024 token 输出）约 78–80 tok/s。细节见 `docs/V100
 
 11-13 Q8 HC 结果标签为 `hcq8-ix-*`，日志 `~/tune/hcq8-{off,on}.engine.log`；交替 decode −0.56%，不采用。IQ4_XS EXPDEC parity / bench 分别保存为 `~/tune/expdec-iq4xs-parity.txt`、`~/tune/expdec-iq4xs-bench.txt`；全逐位一致但相关 T 变慢，不采用。所有实验均未提交或推送。
 
+11-15 `STRATA_PF_WMMA=1 STRATA_PF_WMMA2=1` 重评（3 轮交替，详见 §5.3）：prompt 14K +4.2% / 61K +4.5%（各三轮同向）、3.4K 持平；decode 无退化；质量回归通过，**已入生产**（env 备份 `.bak-before-pfwmma2-20261115-132119`）。实验 config 副本 `~/tune/pfw-off.json` / `pfw-on.json`（含各自 engine log）。
+
 ### 已排除（别再测）
 
 - all-cards split engine：模型的 Q5_0 down 不被支持。
@@ -302,3 +308,41 @@ decode（3.2K/14K，1024 token 输出）约 78–80 tok/s。细节见 `docs/V100
 - 8080 只能跑一个实例。
 - 启动脚本注释说档 A“全部 bitwise/parity”，对 `SM70_TABLE` 不成立。
 - `STRATA_PREFILL_PROMOTE`（官方配置里有）在任何二进制里都不存在，无效。
+
+## 9. 2026-11-13 晚间补充：basalt 调研衍生的四项实测（全部未采用）
+
+对照 basalt（Strata 家族 fork）与 GitHub 调研做的 A/B，全部 3 轮 × 3.4K/14K/61K 交替、512 token、
+每臂重启（数据 `~/tune/results.jsonl`，标签 min1-/wide-/dw4-/dw2-/base-r*）：
+
+| 实验 | 3.4K / 14K / 61K decode（vs 同轮 base 中位） | 结论 |
+|---|---|---|
+| `STRATA_PCIE_MIN1=1`（miss≥2 保底 1 个走 PCIe） | −2.7% / −8.4% / −9.7% | **不采用**。命中率 90→93%、PCIe 0.4→2% 机制生效，但 GPU 经 PCIe 算 miss 比 CPU 贵（PHB 拓扑 + mode-2 copy kernel）。与老扫参 pcie-frac 0.35 变慢一致 |
+| `STRATA_GR_UP_WIDE=1`（up 读一 warp 一行，160→1280 block，上游已写好、逐位） | +1.4% / −2.0% / +1.3% | **不采用**，噪声内无信号 |
+| `STRATA_GR_DOWN_WARPS=4`（down 读 41→81 block，逐位，worktree dw-grid） | −1.3% / −4.2% / +1.3% | **不采用**；prefill 还略亏（block 翻倍 = 激活 staging 冗余翻倍） |
+| `STRATA_GR_DOWN_WARPS=2`（162 block） | −6.3% / −5.0% / −7.6% | **不采用** |
+
+**NEXT-OPT-HC-READ 的 A 路线至此三种形态全部实测否决**（HC_PERSIST 有静默写坏风险；up_wide 无信号；
+down grid 负收益）：T≈3 的 HC 读不是网格饥饿，改占用率在此机不兑现。HC 这 2.71 ms 若再动，
+只剩"每窗口 CPU 侧 gap"一类未验证方向。
+
+其它核对结论（改写本文档部分旧表述）：
+- 专家 arena **早已全量 pin**（57.6 GiB 一次 cudaHostRegister PORTABLE|Mapped 成功），不存在"提高 pin 上限"的空间。
+- **自适应换层默认就是开的**（`--adapt-every 4`/`--adapt-swaps 96` 默认值，generate.cpp:20580 分配 usage；
+  §4 "缓存策略是静态"的表述不对——日志 "no eviction" 只描述 ExpertCache 本身）。
+- `STRATA_ADAPT_FETCH` 与 `STRATA_PCIE_BALANCE` 被 `!multi_gpu` 硬禁（generate.cpp:20582/4849），
+  层切分下无法启用。
+- PCIe 0.6% 的根因：`m=(nmiss×51)>>8`，nmiss≤5 恒 0——设计行为，不是 bug。
+
+实验资产：worktree `~/strata-v100x2-dw`（分支 dw-grid，含 STRATA_GR_DOWN_WARPS 补丁，
+gr_parity 6 组合全 PASS、fused_gr_bench 0 differing；**未提交**）；生产二进制从未被长期替换
+（A/B 后已恢复原文件）。不要重复测以上四项。
+
+### 9.1 采纳：STRATA_FS_SLOTS=2（2026-11-14 入生产）
+
+- **来源**：ForesightSwap 休眠件（#1348），由 basalt/AdapMoE 的 just-missed 重用思路激活实测。
+- **数据**（3 轮 × 3 档交替，同二进制仅 env 差异）：3.4K +1.2% / 14K −1.4% / **61K +4.7%（76.3 vs 72.9 中位，三轮 3/3 同向）**。收益随上下文变长而增大——正是 miss 集中的地方；每请求 4400~6500 个专家从 swap 空间按 GPU 命中服务。
+- **质量**：182 工具结构化 tool_calls 与基线一致；4 短题 3 逐字相同 1 同义改写（GPU/CPU 专家舍入类既有差异）；2048 长输出无循环。
+- **代价**：每卡 ~112 MiB 自有显存（CUDA1 余 399 MiB，LOW 告警原本就有，未触发 stall 阈值 256）。
+- **FS_SLOTS=4 已分诊否决**（61K 71.4 vs FS2 77.3：槽翻倍挤掉专家缓存，不要再加）。
+- 配置备份 `strata-chenjx-q4.json.bak-before-fs-*`；关掉=删 env 里 STRATA_FS_SLOTS。
+- router look-ahead 预测（STRATA_FS_AHEAD）本轮贡献为 0（"0 from the router look-ahead"）——全部收益来自 just-missed 时间重用；预测式预取未证伪，留作后续。
