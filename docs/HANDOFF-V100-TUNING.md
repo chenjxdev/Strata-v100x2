@@ -269,6 +269,10 @@ decode（3.2K/14K，1024 token 输出）约 78–80 tok/s。细节见 `docs/V100
 
 11-13 `STRATA_STAGE_TRIM=1`，生产二进制与原 profile，每档独立重启两次取中位：
 
+**11-16 上游 742 提交大合并（0.2.14.1 / engine 0.1.60）+ MMQ 误 OFF 事件**：重建漏 `-DSTRATA_MMQ=ON`（上游 f40f8caca 翻默认）→ 14K prefill 掉到 **1040-1091**；显式 ON 重建后 **1595-1621 tok/s**，超历史最好 6-9%（上游 prefill 改进 + chunk 上限 32768 是净收益；`STRATA_NV_CHUNK=0` 可回 8192 但暂无必要）。decode 78-82 正常。上游改动里需留意的：prefill 融合专家 down-rotation/FP16-down/P1A 每线程状态（CUDA1 +~190 MiB 固定占用的嫌疑来源，auto 缓存 -79 槽 ≈ -0.4% decode，接受）。
+
+11-13 `STRATA_STAGE_TRIM=1` 原始数据：
+
 | prompt 档 | prefill 原 → trim | 变化 | decode 原 → trim | 变化 | 命中率原 → trim |
 |---|---:|---:|---:|---:|---:|
 | 3.2K | 825.9 → 890.0 | +7.77% | 77.2 → 86.7 | +12.31% | 85.6% → 88.7% |
@@ -299,7 +303,7 @@ decode（3.2K/14K，1024 token 输出）约 78–80 tok/s。细节见 `docs/V100
 ## 8. 仓库、构建与其它坑
 
 - 源码：`~/strata-v100x2-git`（0.1.59.1 + 上表改动），生产构建 `build-v100`（`build-v100/strata`）。
-- 构建：`cmake -S . -B build-v100 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc`，增量 `cmake --build build-v100 -j18`（全量 15–20 分钟）。**试验性改动另建构建目录**，别动生产的 `build-v100`。
+- 构建：`cmake -S . -B build-v100 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -DSTRATA_MMQ=ON`，增量 `cmake --build build-v100 -j18`（全量 15–20 分钟，实测 8.5 分钟）。试验性改动另建构建目录，别动生产的 `build-v100`。**`-DSTRATA_MMQ=ON` 必须显式给（2026-11-16 血训）**：上游 f40f8caca 把它默认翻成 OFF（0.2.14/0.1.60 起），漏了它 = llama.cpp MMQ 调度器 + Q5_0 实例 + MMQ_DIRECT 全不编（ORCA=ON 也救不了，消费它的 `strata_cuda_mmq()` 整个不建），14K prefill 从 ~1600 掉到 ~1050（**-30%**，实测 1040-1091 vs 1595-1621）。现 build-v100 缓存已是 ON；任何**新构建目录**都会默认 OFF 再踩一次。
 - 测试构建：另建目录加 `-DSTRATA_BUILD_TESTS=ON`；`expdec_bench` 等是 `EXCLUDE_FROM_ALL`，要 `--target` 单独编。GPU 测试需要停服务（显存被占满）。
 - 官方引擎：`~/.local/share/strata/components/engine/0.1.59-linux-x86_64-cuda-cuda12/strata`（另有 0.1.55、0.1.57），也是 `STRATA_EXPERIMENTAL_SM60=ON` 构建。
 - 文档：`docs/V100_PORT_CANDIDATES.md`（移植清单 + 实测）、`docs/HANDOFF-V100-TUNING.md`（本文）；本地副本 `D:\workspace\V100-TUNING-HANDOFF.md`。
