@@ -17,7 +17,7 @@
 | CPU / 内存 | Xeon E5-2686 v4，18 核 ×2 SMT = 36 线程，单 NUMA，125 GB RAM，**有 AVX2，没有 AVX-512 / VNNI** |
 | 磁盘 | 单块 256 G NVMe（`/`，剩约 60 G） |
 | 驱动 / CUDA | 580.178.04 / CUDA 13.0（构建用 12.9，`/usr/local/cuda-12.9`） |
-| 功耗上限 | GPU0 **145 W**、GPU1 **170 W**（`nvidia-power-limit.service` 开机应用；2026-11-16 核实，此前文档写 150/180 已过时）。**GPU1 降到 165W 已实测否决**：同 boot A/B/A，decode 均值 71.5-72.0 vs 74.1-74.5 tok/s（**-2.6~-4%**）；机制：负载期 GPU1 峰值功耗 ~173-181W，本就顶着 170W 上限，165W 必然削峰降频。小 prompt（≤70 tok）prefill 无差异；大 prompt 方差大但峰值证据表明先被削。别再试 165W |
+| 功耗上限 | GPU0 **145 W**、GPU1 **170 W**（`nvidia-power-limit.service` 开机应用；2026-11-16 核实，此前文档写 150/180 已过时）。**GPU1 165W 已实测否决**：同 boot A/B/A，decode 均值 71.5-72.0 vs 74.1-74.5 tok/s（**-2.6~-4%**）。**175W 也已测（交替 4+4 臂取中位）**：decode 中位 72.9 vs 73.5 tok/s（**-0.8%，噪声内无差异**；峰值仍摸到 174-177W）。**170W 即甜点位，两个方向都不必动**。功耗测试注意：连跑多臂有专家缓存热身漂移（后面的臂天然偏快），必须交替取中位，别信单臂 |
 | ECC | `Enabled`，关掉实测省 0 MiB |
 | 模型 | `/data/models/Qwen3.8-Flash-Next-UD-IQ4_XS-abliterated`（89 G），pack `/data/models/packs/ud-iq4_xs-abliterated`，MTP `/data/models/mtp/rt` |
 | API | `http://<SERVER-IP>:8080/v1`，key `<API-KEY>`；网页版 `http://<SERVER-IP>:8080/` |
