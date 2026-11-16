@@ -101,15 +101,6 @@ bool mtp_catchup_all() {
     }();
     return on;
 }
-// the same, for the pipelined chain's round only (chain_launch): STRATA_MTP_CHAIN_CATCHUP_ALL=1 keeps catching the
-// whole window up there while the serial path shrinks (a fresh-chain-only rollback for the A/B)
-bool chain_catchup_all() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_MTP_CHAIN_CATCHUP_ALL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return on;
-}
 // STRATA_MTP_Q8_SM60=1 (opt-in, with STRATA_Q8_SM60=1): the drafter's own Q8_0 matrices (the draft head's subset,
 // the projections) run on the Pascal GEMV too (the drafts differ in rounding only: the Pascal kernel sums in another
 // order; the replies do not depend on the drafts)
@@ -1987,13 +1978,6 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         err = "mtp: chain arguments out of range";
         return false;
     }
-    // #783 PR-i, the pipelined chain: the round catches the drafter's K/V up only to the accepted row (T = a + 1),
-    // like the serial draft() path - the K/V of the rejected rows is not caught up (no later read reaches a cell
-    // past the one being drafted; the next round's window writes those cells first; the undo of a wrong guess
-    // replays undo_keep = a + 1 rows too).  The chain's own catch-up graph is per-T (prepare_chain captured every
-    // T), so this only picks the smaller one: the copy of the T residual rows, the record_front of T cells and the
-    // mapped staging shrink with it.  STRATA_MTP_CHAIN_CATCHUP_ALL=1 keeps the whole window (the old behaviour).
-    if (!mtp_catchup_all() && !chain_catchup_all() && a + 1 < T) T = a + 1;
     if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     for (int j = 1; j < n_out; ++j)
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
