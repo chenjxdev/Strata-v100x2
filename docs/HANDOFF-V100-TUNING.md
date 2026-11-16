@@ -1,6 +1,6 @@
 # 交接文档：Strata V100 提速调优（给下一个 agent）
 
-最后更新：2026-11-13 (Asia/Shanghai)。
+最后更新：2026-11-15 (Asia/Shanghai)。
 
 **目标：在尽量不降低生成质量的前提下提速。** 用户确认当前生产配置的质量正常，不需要排查质量问题。每项提速改动做完后，用第 6 节的回归集确认质量没有变差即可。
 
@@ -11,9 +11,9 @@
 | 项 | 值 |
 |---|---|
 | 主机 | `<SERVER-HOST>`，Ubuntu 22.04，**服务器时钟是 UTC**（比北京慢 8 小时） |
-| SSH | `<SSH-USER>@<SERVER-IP>:22`，密码 `<SSH-PW>`（sudo 同密码） |
+| SSH | `<SSH-USER>@<SERVER-IP>:22`，密码 `<SSH-PW>`（sudo 同密码）——**真实值不进仓库，见仓库外本地副本 `V100-TUNING-HANDOFF.md`** |
 | GPU | 2 × Tesla V100-SXM2-16GB（sm_70，各 Gen3 x16） |
-| GPU 互连 | **NVLink 全部 inactive**，拓扑 `PHB`（走 CPU 的 PCIe 桥），`cudaDeviceCanAccessPeer` 双向可用 |
+| GPU 互连 | **PCIe-only：本机硬件就没有 NVLink（用户确认，2026-11-15），不要再假设可激活或作为调优方向**；拓扑 `PHB`（走 CPU 的 PCIe 桥），`cudaDeviceCanAccessPeer` 双向可用 |
 | CPU / 内存 | Xeon E5-2686 v4，18 核 ×2 SMT = 36 线程，单 NUMA，125 GB RAM，**有 AVX2，没有 AVX-512 / VNNI** |
 | 磁盘 | 单块 256 G NVMe（`/`，剩约 60 G） |
 | 驱动 / CUDA | 580.178.04 / CUDA 13.0（构建用 12.9，`/usr/local/cuda-12.9`） |
@@ -73,6 +73,7 @@ nvidia-smi --query-gpu=index,memory.used,power.draw,power.limit --format=csv
 - `args`：`--layer-split 25`、`gpu=[1,0]`、`--max-context 262144`、`--kv int8`、`--kv-resident 32768`、`--pipeline-windows 2`、`--vram-reserve-mib/-later-mib 512/512`、`--spec 4 --spec-min-p 0.6`、`--mtp /data/models/mtp/rt`、`--suffix-draft 6`、`--pcie-frac 0.20`、`--pool-workers 14`、`--expert-cache auto`、`--expert-profile terminal/0.1.49.2/data/expert-profile.bin`、`--vision`。
 - `env`：`STRATA_SM70_TABLE=0`、`STRATA_STAGE_TRIM=1`、`STRATA_PREFILL_CPU_SHARE=auto`、`STRATA_PREFILL_CPU_SHARE_MAX=6144`、`STRATA_PREFILL_STREAM_MIN=6144`、`STRATA_HC_Q8=0`、`STRATA_ROUTE_TAIL_SKIP=0`、`STRATA_AUX_CPUS=auto`、`STRATA_EMB_REUSE_ACCOUNT=1`、`STRATA_KV_GROW=1`、`STRATA_WATCHDOG_S=300`。
 - `STRATA_PF_WMMA` / `PF_WMMA2` 目前**没开**（11-12 开过，后来撤掉）。
+- **质量否决（用户实测反馈，2026-11-15）**：`STRATA_SM70_TABLE=1` 实测智商下降，后续不再考虑整表或相关组合开关；保持 `STRATA_SM70_TABLE=0`，不得作为性能候选重试。
 - 日志确认 sm_70 默认表开了 10 项（`SM70_TABLE` 被配置关掉）。
 - trim 前备份：`strata-chenjx-q4.json.bak-before-stage-trim-20261113-045640`；更早备份：`.bak-before-pfwmma-20261112-130109`、`.bak-nsys`、`.bak-pcie`。**改配置前先备份。**
 - **不要给生产或 pipelined verify 诊断配置加 `CUDA_LAUNCH_BLOCKING=1`**：引擎明确报告它与 verify window 不兼容（#1341），会让 prompt 卡到 watchdog，而不是帮助定位。
@@ -110,7 +111,7 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 | 草稿接受率 | 中位 0.77（`--spec 4` + MTP + suffix draft） |
 | decode 专家缓存命中率 | p10 76% / 中位 86% / p90 89%；没命中的几乎都由 CPU 算，PCIe 读只占约 1% |
 | 缓存槽 | CUDA0 4383 + CUDA1 3511 = 7894 个，占全部专家的 32% |
-| 缓存策略 | **静态**：启动时按 profile 填满，不换出，没有自适应换入 |
+| 缓存策略 | **（2026-11-15 更正，原"静态"描述有误）**启动按 profile 填满（日志 "PROFILE, no eviction" 只指初始填充）；**自适应换入层默认开启（阻塞式）**：`--adapt-every 4`、`--adapt-swaps 96`、decay 0.7、min-gain 1.5（generate.cpp:888/924/13187+，含换出围栏、交换缓冲、layer-split 感知）；`--adapt-async 1`（异步层，窗口间隙推进）未启用。服务器恢复后 grep 引擎日志 `adaptive tier` 看实际轮次/换入数再定调参方向 |
 | 小块 prompt（< 2K token）读取 | p10 51 / 中位 130 / p90 413 tok/s，几十 token 的读取也要 1 秒多 |
 | 显存 | CUDA1 加载完只剩 511 MiB（日志报 LOW），有一次请求开始时只剩 487 MiB |
 
@@ -157,20 +158,48 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 
 | 旋钮 | 现状 | 说明 |
 |---|---|---|
-| `--layer-split` | 25 | 试 23 / 27：GPU0 被 150 W 压着；配合 5.2 后再看 |
+| `--layer-split` | **25，不再调** | **用户指示（2026-11-15）：固定 25，不要再试 23/27 或其他值** |
 | `--pool-workers` | 14 | 试 16，配合 `STRATA_AUX_CPUS` |
 | `--pipeline-windows` | 2 | 试 0 对照 |
+| `--adapt-async` | 0（阻塞式） | 异步自适应层：job 线程在 verify 窗口间隙推进换入轮（1Cat 同款结构）；arena 模式配 `STRATA_ADAPT_PICK_INLINE/ASYNC_WAIT/ASYNC_BATCH`；**非逐位一致（文档注明），必须过质量回归**；先看日志 `adapt wait` 占比再决定 |
+| `--mtp-draft-vocab` | 默认 `rt/draft_vocab.bin` | 已有功能：draft 头只算子表行（验证仍全表）。服务器恢复后：`ls /data/models/mtp/rt/draft_vocab.bin` + 查日志子表大小；可自用语料重生成更贴负载的子表（A/B 接受率） |
 | `--spec` | 4 | 试 6/8；只影响草稿窗口，输出经验证不变，但可能更慢 |
 | `STRATA_PF_GROUP_SCRATCH=1` + `STRATA_PF_HC_REGION=1` + `STRATA_TQ_SUB8=1` | 未设 | fork 实测 prompt −2~−6% 耗时，group scratch 改舍入 |
-| `STRATA_SM70_TABLE=1` | 0 | 专家层 mode 8 等；表整体只测到约 +1%，mode 8 在 V100 上没有逐位验证记录，优先级低 |
+| `STRATA_SM70_TABLE=1` | **禁用** | **用户实测智商下降，质量否决，不再考虑或重试**；保持 0，相关组合开关也不作为后续候选 |
 | `--vram-reserve-mib` / `-later-mib` | 512 / 512 | **不要再往下调**：日志已经建议 later 加到 769；5.2 做完后再看 |
 
 ### 5.5 更深的方向（需要较大改动）
 
-- **decode 单 token 专家的同步延迟**：CPU 池自旋 49%、GPU 等待 20%。要么减少 CPU 侧的逐层同步，要么让单 token 的缺失专家走 PCIe 由 GPU 算（`--pcie-frac` 扫过，0.20 已最优，单靠这个参数不行）。11-13 源码追踪确认 waitA / waitB / waitCPU 共用一个 spin kernel，旧 nsys 的 20% 不能直接归因于 CPU；下一步先用现有 `STRATA_DECODE_TIMING=1` 和 `STRATA_VERIFY_PROFILE=1` 分解，不再盲调。
+**2026-11-15 已收逐窗口 GPU stage 分解**（`STRATA_VERIFY_PROFILE=1`+`STRATA_DECODE_TIMING=1` 临时注入重启采集，已还原；两 stage 各 14-16 ms GPU/窗口，wall 26-34 ms）。持续 decode（热缓存）下每窗口 GDN 层：稠密投影 q8+qkv gemv 1.46 + out-proj 0.60；专家命中路径 VRAM hits 2.10（最大单项真实计算）；miss 税 waitA 0.43+waitB 0.50+waitCPU 0.87+PCIe 0.20+copy 0.39 ≈ **2.4 ms 热 / 5.75 ms 冷**（冷窗口 19.5 ms 时 waitA 1.79+waitB 1.74+waitCPU 2.22）；**HC ≈ 2.2（GDN 层）+ 0.9（QSA 层）≈ 3.1 ms ≈ 窗口的 20%**；router+plan 0.63、shared+quant 0.75；QSA 全部 ≈ 3.0；stage1 另有 head 1.15。**HC 立项修正（2026-11-15 源码精读后）**：上文"1Cat 手法适用、砍半即 +5-10%"**说过头了，收回**。差距矩阵：①1Cat 的 HC 优化是 TP4 跨卡交换重叠（94 串行边界），本机 layer-split 整层单卡**无此结构**；②权重预取同思路（STRATA_GR_V3_PF）在 Blackwell 实测更慢（+17%），V3 读在 sm_86 实测 -3~-6%；③norm 已融合进 down；④staged 变体已有 cp.async 两 tile 流水。另 profile 的 hc0 norm 0.42 vs hc1 0.15 三倍差不是异常——hc0 的读还写 q8_1 图像（S26 QFUSE）。Strata HC 剩余空间是 GEMV 有效带宽（实测 ~35-40µs/半层 vs 带宽下限 ~15µs，约 2x 理论），属内核 tile 微调且邻近尝试为负。**零代码 A/B 已跑完（2026-11-16，每变体独立重启 + 同 5 题负载，基线 q0 74.3 / q1 80.5 / q2 69.3 / q3 85.4 / q5 74.6 tok/s）——全部否决，现配置即这三个旋钮的最优**：①`STRATA_SPEC_ADAPT_EVERY=2`+`WARM=200` 热身加速：**-3~-7% 一致负**（PCIe 双卡上早期换入代价>命中率收益，与 sm_86"未复现"历史一致），别再试；②`STRATA_GR_V3=1`：约 -1% 噪声内偏负（V100 与 sm_86 同为负，sm_120 专属成立），别再试；③`STRATA_HC_SPLIT=0`（plain）-3~-26%、`=1`（split）-3~-13%，**staged（默认/auto）最优保持**。**配置级红利确认归零；下一个方向只剩 VRAM hits 2.1 ms 的专家内核带宽（1Cat dp4a/QPN 系移植，真正的内核工程），或更深的 miss 路径重构。**
+
+- **decode 单 token 专家的同步延迟**：CPU 池自旋 49%、GPU 等待 20%。要么减少 CPU 侧的逐层同步，要么让单 token 的缺失专家走 PCIe 由 GPU 算（`--pcie-frac` 扫过，0.20 已最优，单靠这个参数不行）。11-13 源码追踪确认 waitA / waitB / waitCPU 共用一个 spin kernel，旧 nsys 的 20% 不能直接归因于 CPU；上面 11-15 的分解就是这一步的产出，继续按它立项。
 - **CUDA 门铃直写已实测不采用**：独立 worktree `~/strata-v100x2-doorbell` 放开 `STRATA_DOORBELL_STORE=1` 对 CUDA 的支持，复用已知序号直写内核，payload/序号 parity 通过。首轮非交替 decode 中位 +1.9%，但三轮 off/on 交替后只有 **90.1 → 90.3 tok/s（+0.22%，噪声内）**，无 CUDA/Xid/NEVER-RANG。未进生产；不要只凭首轮结果重试。
 - **IQ4_XS gate/up 接入 EXPDEC 已实测不采用**：独立 worktree `~/strata-v100x2-expdec` 给 `Split<23>` 补 `apply_u`、无 grid 的 `EdGrid<23>`、白名单和模板分发；`iq_multi_parity` 真实 2560×640 几何及 `expdec_bench 23/20` 全逐位一致。该类型覆盖 3,350/9,632 个常驻专家，但 V100 双卡在 T=1/2 的 gate/up 均变慢，R2 更差；只有 T=4 real 约快 1–4%。生产平均 T≈2.7，因此没有做端到端，未进生产。Q5_0 down 不是 drop-in，未混入此补丁。
 - **小块 prompt 的首 token 延迟**：58-token 与 90-token 请求走不同路径（默认 short_read=64；当前 verify S=6）。冷请求 783 ms 中，24 次 verify graph 懒 capture 合计约 219 ms，可在 READY 前做默认关闭的预热，但只改善首次请求。热路径优先测每层 doorbell、host/pool 和 drain；`STRATA_PREFILL_TIMING=1` 只覆盖 batched prefill，不包含 verify-window 外围的 loan/refill/checkpoint。
+
+### 5.6 1Cat-vLLM 借鉴清单（2026-11-15 调研，仓库 D:\workspace\1Cat-vLLM，1CatAI/1Cat-vLLM@b7baf77，v1.5.3）
+
+同模型（Qwen3.8-Flash-Next）同硬件（V100 SM70）的 vLLM 工程分支，下面按对本机的适配度排序。**跨卡带宽相关的借鉴全部要打折实测**：他们是 NV2 mesh，本机 PCIe（他们自己的 ring collectives 只认 NVLink 直连对，PCIe 回退 PyNCCL）。
+
+**首查（可能破案 SM70_TABLE 质量否决，且修复几乎免费）**：1Cat 把 GDN 循环状态默认设为 **FP32**，源码注释原话（`vllm/model_executor/layers/mamba/mamba_utils.py:109-124`）："following the model dtype here can make MTP verification drift into self-consistent repetition after long outputs"（FP16 状态 → 长输出自洽重复退化）。本机 = Flash-Next（GDN 层）+ MTP + 长输出，与"实测智商下降"表现吻合。**第一步：查 Strata 的 GDN/SSM 状态 dtype；若跟随模型 FP16，切 FP32（状态块很小，256K 请求约 272.9 MiB 量级）。→ 2026-11-15 已查：`session.cpp:96` 的 `gdn_state_floats` 分配的就是 FP32 `float*`，该嫌疑排除，SM70_TABLE 质量下降另有原因，需走质量度量定位。** 两条配套 MTP 铁律（他们血泪换来）：draft 永远 PIECEWISE 图（捕获成 FULL 图会"collapse acceptance"，`llm_base_proposer.py:573`）；GDN 前向在 FULL 图下必须整体一个不透明边界（`VLLM_SM70_QWEN_GDN_FULL_FORWARD=1`），拆开编译即复现"接受率 1.000 + 重复流"。
+
+**质量度量方法论**（替代主观"智商下降"判断）：digit_ratio（数字字符占比）/ weird_runs / max_digit_run / 输出 hash 对比 + **自然 EOS**（强制续写会污染失败信号）。完整实验矩阵见其根目录 `SM70_FLASH_V100_QUALITY_EXPERIMENT_LOG_20260615.md`（根因：CUDA graph 回放时元数据缓冲未刷新，**不是数值精度**——查 Strata 的开关时先排除同类 bug，对照 `gpu_input_batch.py:refresh_metadata` 模式）与 `SM70_MTP_OUTPUT_QUALITY_AUDIT_20260616.md`。
+
+| 本机痛点 | 1Cat 方案 | 关键位置（相对 1Cat 仓库根） |
+|---|---|---|
+| 专家缓存命中率 p10 76%（**自适应换入层已存在**，2026-11-15 核实，见第 4 节更正；可借鉴的是启用 `--adapt-async`、调 decay/min-gain/every/swaps） | host ring + 每层 LRU 规划器 + 拷贝引擎 DMA 写回；"decode miss 由 host 线程拷入、step 在图内等待" | `csrc/gguf_expert_cache.cpp`、`gguf_shared_expert_{planner,dma}.*`、`vllm/config/kernel.py:546-610`（`expert_cache_fraction` 等） |
+| miss 专家 CPU 池自旋 49% | 专家 80% GPU / 20% host 放置 + 小 miss 计划专用拷贝内核（提速 6-20%） | `docs/design/flashnext_decode_verifier_16gb_20261014.md` |
+| 路由重复读专家（74% 专家单 token） | active-expert 紧凑分组 decode：重复 expert ID → offset 式多行 segment，已准入同模型族 | `docs/design/sm70_qwen38_awq_active_grouped_decode.md`，开关 `VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE` |
+| MTP 接受率中位 0.77 | **已有同款（2026-11-15 核实）**：`--mtp-draft-vocab FILE`，默认 `<mtp>/draft_vocab.bin`（存在即用；data/draft_vocab_en.bin 40K 为例），draft 头只取子表行、验证仍全表（mtp.hpp:68-76, mtp.cpp:549 有接受率代价度量）。可做的是：确认生产子表生效与大小、用语料重生成更贴负载的子表 | `vllm/model_executor/models/qwen3_5_mtp_sm70_head.py`、`vllm/v1/spec_decode/{static_draft_vocab,draft_prob_alignment}.py`、`csrc/sm70_turbomind/ops/mtp_local_top1_sm70.cu` |
+| 显存 LOW（曾剩 511 MiB） | 专家 bank 单设备分配（views+零尾）/ pinned host 池按 worker 合一（power-of-2 舍入浪费 81%）/ 13-bit 无损 draft 专家存储（FP16 正常值尾数 3 个零位，逐位不变，省 225 MiB/rank）/ 只捕获实际用的图、target/draft 捕获间释放 eager 块 | `docs/design/flashnext_16gb_host_kv.md`、`docs/design/sm70_memory_defaults.md` |
+| KV 挤占专家显存 | host 权威历史 + GPU 热缓存（8-16K），NVLink 下实测代价仅 ~2.6%；**PCIe 代价未知需实测** | `docs/design/flashnext_16gb_host_kv.md`、`flashnext_host_fp8_kv.md` |
+| HC 2.6-2.8 ms/stage（decode 第二大头） | down 权重前先发块 partials、交换期预取 up 权重、延迟全局 RMS、低秩 chunk 就绪发布；他们 HC 94 串行边界 ×32.9µs=3.09 ms/round，列为结构优化第一目标 | `docs/design/flashnext_persistent_execution.md`（HC 节）、`vllm/distributed/device_communicators/sm70_hc_ll.py` |
+| 首 token 懒 capture 219 ms | 按上下文长度分桶预捕获 FULL 图（q=1 decode 按压缩+FP8-KV 分桶，MTP verify 显式桶覆盖最长请求） | `vllm/sm70_profiles/cudagraph_policy.py` |
+| STRATA_* 开关已几十个 | Policy 字段系统：内核读解析好的 policy 值而非裸 env，engine-local 配置 | `csrc/sm70_policy.h` + `sm70_policy_fields.inc` |
+| MMQ/wmma 分发靠手调 | GEMM 形状调优 LUT 可导入 | `csrc/sm70_turbomind/ops/gemm_runtime.cpp`，`VLLM_SM70_GEMM_LUT_PATH` |
+
+**他们已否决/不适用，别从他们搬**：持久化 megakernel 只是提案无实测（MonoMoE/MPK/Hazy 都是 SM80+ 的 TMA/cp.async/WGMMA，V100 无此硬件）；FLUTE 式 LUT 复制（8 KB 表 × 32 份超 V100 共享内存）；TurboQuant KV 本机已排除（见第 7 节）；一切 TP4-NVLink 绝对数字。
+
 
 ---
 
@@ -186,6 +215,7 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 
 ### 质量回归（每项改动都跑）
 
+- **定量度量（2026-11-15 新增，1Cat 方法论）**：`python tools/output_quality.py 回复文件... --json run.json` 打 digit_ratio / max_digit_run / num_repeat_runs / weird_runs / weird_share / sha256（退出码 0/1/2），`--compare base.json cand.json` 对比两轮配置。阈值已按本机健康产出校准（纯标点重复/整行代码重复/短回复数字占比不算退化；HTML 的 ~2.6% 数字不算 WARN）。**基线已收**：`D:\workspace\strata-quality\baseline.json`（5 题：数学/KV cache/代码/中文短文/长 HTML，greedy），采集脚本 `D:\workspace\strata-quality\collect.py`。改动后同题重收，`--compare` 看漂移。
 - 182 工具的 agent 请求：必须返回结构化 `tool_calls`（之前是 `read_file(src/main.cpp)`）。
 - 4 道短题：答案与基准一致（措辞可以不同）。
 - 1 道长输出题：看是否出现循环、生成 token 数是否异常。
