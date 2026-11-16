@@ -219,7 +219,7 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 
 ### 质量回归（每项改动都跑）
 
-- **定量度量（2026-11-15 新增，1Cat 方法论）**：`python tools/output_quality.py 回复文件... --json run.json` 打 digit_ratio / max_digit_run / num_repeat_runs / weird_runs / weird_share / sha256（退出码 0/1/2），`--compare base.json cand.json` 对比两轮配置。阈值已按本机健康产出校准（纯标点重复/整行代码重复/短回复数字占比不算退化；HTML 的 ~2.6% 数字不算 WARN）。**基线已收**：`D:\workspace\strata-quality\baseline.json`（5 题：数学/KV cache/代码/中文短文/长 HTML，greedy），采集脚本 `D:\workspace\strata-quality\collect.py`。改动后同题重收，`--compare` 看漂移。
+- **定量度量（2026-11-15 新增，1Cat 方法论）**：`python tools/output_quality.py 回复文件... --json run.json` 打 digit_ratio / max_digit_run / num_repeat_runs / weird_runs / weird_share / sha256（退出码 0/1/2），`--compare base.json cand.json` 对比两轮配置。阈值已按本机健康产出校准（纯标点重复/整行代码重复/短回复数字占比不算退化；HTML 的 ~2.6% 数字不算 WARN）。**基线已收**：`D:\workspace\strata-quality\baseline.json`（5 题：数学/KV cache/代码/中文短文/长 HTML，greedy），采集脚本 `D:\workspace\strata-quality\collect.py`。改动后同题重收，`--compare` 看漂移。**测量档案（A/B 总账、方法学教训、全部原始数据）见 `D:\workspace\strata-quality\README.md`——该目录在仓库外，脚本含服务器信息**。
 - 182 工具的 agent 请求：必须返回结构化 `tool_calls`（之前是 `read_file(src/main.cpp)`）。
 - 4 道短题：答案与基准一致（措辞可以不同）。
 - 1 道长输出题：看是否出现循环、生成 token 数是否异常。
