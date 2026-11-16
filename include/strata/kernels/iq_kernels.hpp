@@ -191,8 +191,5 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
 bool gemm_iq_f16_grouped_q5_0();
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
-/// Q5_0's decode-once down rows (Split<6>, opt-in STRATA_Q50_SPLIT=1 at startup until the V100 A/B decides; bitwise
-/// the per-entry kernel either way).  Set before graph capture.
-void iq_set_q50_split(bool on);
 
 }  // namespace strata::kernels

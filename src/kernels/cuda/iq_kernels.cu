@@ -912,12 +912,7 @@ template<int TY> inline constexpr bool kSplit = false;
 // run only with STRATA_KQ_SPLIT=1 until the A/B on the measured cards decides (bitwise the old kernels either way).
 template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 8);   // not Q5_1: its Split apply is not bitwise the old dot (FMA contraction), see notes-151-amd
 inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
-// Q5_0 (type 6) joins the decode-once down kernels only with STRATA_Q50_SPLIT=1 until the V100 A/B decides, like the
-// K-quants above (bitwise the per-entry kernel either way, iq_multi_parity).  The UD-IQ4_XS pack keeps its down
-// experts Q5_0 in 33 of 48 layers (OrcaRouter Q4_K_S too), and before this the window re-read each expert's Q5_0
-// rows for every entry of the group - the weight side was the only part of the per-entry loop that could move out.
-inline bool g_q50_split = [] { const char* v = std::getenv("STRATA_Q50_SPLIT"); return v != nullptr && v[0] == '1'; }();
-template<int TY> inline bool split_off() { return (kq_type<TY> && !g_kq_split) || (TY == 6 && !g_q50_split); }
+template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
@@ -1235,50 +1230,6 @@ template<> struct Split<20> {   // IQ4_NL
         sumi = ggml_cuda_dp4a(r.v[1].y, p1.y, sumi);
         const float d = r.dw * d8;
         return d * sumi;
-    }
-};
-template<> inline constexpr bool kSplit<6> = true;
-template<> struct Split<6> {   // Q5_0 - the first qk=32 format here: one W is one (kbx, iqs) slice of the row, exactly
-    // vec_dot_q5_0_q8_1's vi0/vi1 bit surgery with the -16 taken on the QUANTIZED activations' sum (Round 0214), so
-    // row_dot_multi<6> is bitwise row_dot<6>: integers are exact whatever the accumulation order, and the one float
-    // expression per call (dw * d8 * (sumi - 16 * sumu)) is the original's.  No grid to stage; STAGE_GRID is ignored.
-    struct W { int lo[VDR_Q5_0], hi[VDR_Q5_0]; float dw; };
-    template<bool STAGE_GRID = false>
-    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
-        const block_q5_0* bq5_0 = (const block_q5_0*) vbq + kbx;
-        const int vh = get_int_b2(bq5_0->qh, 0);
-        W r;
-#pragma unroll
-        for (int i = 0; i < VDR_Q5_0; ++i) {
-            const int vl = get_int_b2(bq5_0->qs, iqs + i);
-            const int vhs = vh >> (4 * (iqs + i));
-            int vi0 = (vl >> 0) & 0x0F0F0F0F;
-            vi0 |= (vhs << 4) & 0x00000010;
-            vi0 |= (vhs << 11) & 0x00001000;
-            vi0 |= (vhs << 18) & 0x00100000;
-            vi0 |= (vhs << 25) & 0x10000000;
-            int vi1 = (vl >> 4) & 0x0F0F0F0F;
-            vi1 |= (vhs >> 12) & 0x00000010;
-            vi1 |= (vhs >> 5) & 0x00001000;
-            vi1 |= (vhs << 2) & 0x00100000;
-            vi1 |= (vhs << 9) & 0x10000000;
-            r.lo[i] = vi0;
-            r.hi[i] = vi1;
-        }
-        r.dw = __half2float(bq5_0->d);
-        return r;
-    }
-    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
-        int sumi = 0, sumu = 0;
-#pragma unroll
-        for (int i = 0; i < VDR_Q5_0; ++i) {
-            const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
-            sumi = ggml_cuda_dp4a(r.lo[i], u0, sumi);
-            sumi = ggml_cuda_dp4a(r.hi[i], u1, sumi);
-            sumu = ggml_cuda_dp4a(0x01010101, u0, sumu);
-            sumu = ggml_cuda_dp4a(0x01010101, u1, sumu);
-        }
-        return r.dw * __low2float(bq8_1->ds) * (float) (sumi - 16 * sumu);
     }
 };
 template<> inline constexpr bool kSplit<23> = true;
@@ -5371,7 +5322,6 @@ constexpr bool nib_layout(const NativeExpertLayout& L) {
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
-void iq_set_q50_split(bool on) { g_q50_split = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
