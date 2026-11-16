@@ -163,7 +163,7 @@ strata serve: CUDA1: 511 MiB of VRAM free with everything loaded - LOW ...      
 | `--pipeline-windows` | 2 | 试 0 对照 |
 | `--adapt-async` | 0（阻塞式） | 异步自适应层：job 线程在 verify 窗口间隙推进换入轮（1Cat 同款结构）；arena 模式配 `STRATA_ADAPT_PICK_INLINE/ASYNC_WAIT/ASYNC_BATCH`；**非逐位一致（文档注明），必须过质量回归**；先看日志 `adapt wait` 占比再决定 |
 | `--mtp-draft-vocab` | 默认 `rt/draft_vocab.bin` | 已有功能：draft 头只算子表行（验证仍全表）。服务器恢复后：`ls /data/models/mtp/rt/draft_vocab.bin` + 查日志子表大小；可自用语料重生成更贴负载的子表（A/B 接受率） |
-| `--spec` | 4 | 试 6/8；只影响草稿窗口，输出经验证不变，但可能更慢 |
+| `--spec` | 4 | **6 已实测否决（2026-11-16）**：-2~-20%（q1 最差）；接受率降到 0.49/位（741/1512），第 5/6 草稿几乎不中被接受但每窗口多付验证计算。8 不必再试 |
 | `STRATA_PF_GROUP_SCRATCH=1` + `STRATA_PF_HC_REGION=1` + `STRATA_TQ_SUB8=1` | 未设 | fork 实测 prompt −2~−6% 耗时，group scratch 改舍入 |
 | `STRATA_SM70_TABLE=1` | **禁用** | **用户实测智商下降，质量否决，不再考虑或重试**；保持 0，相关组合开关也不作为后续候选 |
 | `--vram-reserve-mib` / `-later-mib` | 512 / 512 | **不要再往下调**：日志已经建议 later 加到 769；5.2 做完后再看 |
