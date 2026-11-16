@@ -59,6 +59,7 @@ const char* name_of(int t) {
         case 20: return "IQ4_NL";
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
+        case 6: return "Q5_0";
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
@@ -431,12 +432,14 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
+    k::iq_set_q50_split(true);   // Split<6> (STRATA_Q50_SPLIT): the Q5_0 down rows below compare the decode-once
+                                  // kernels with the per-entry ones; the env default stays off until the V100 A/B
     for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
-        for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
+        for (int dt : {20, 42, 6}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape (6: Q5_0 down, Split<6>)
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
     // UD-Q4_K_XL (run with STRATA_KQ_SPLIT=1 to compare the Split path with the old kernels; STRATA_EXPERT_V2K=0 / 1 picks
