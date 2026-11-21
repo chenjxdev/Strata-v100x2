@@ -119,7 +119,32 @@ temperature 0，`max_tokens 256`。
 5. **官方 upstream 没有 V100 默认开关表**：`engine/src/core/nv_defaults.cpp` 只有 sm_86 / sm_120 / sm_121 / sm_60，
    `cc_major < 8` 直接走 FP16 prompt 老路 —— V100 是 upstream 里最没被调过的路径，所有 V100 优化默认全关。
 
-## 6. 还没试的候选
+## 6. 重要差异：prompt 路径没有 MMQ（上游 0.2.16 移除了它）
+
+本仓库的 11-16 审计记录写过：**`STRATA_MMQ` 在上游默认 OFF，不带 `-DSTRATA_MMQ=ON` 重建会掉约 30% prefill**
+（14K prompt：1040-1091 vs 1595-1621 tok/s）。这条结论今天仍然成立，但原因要说清楚：
+
+- **上游 0.1.63 的新 `engine/` 树里根本没有 `STRATA_MMQ` 这个构建选项。**
+  它的 cmake 里只剩 `STRATA_DENSE_MMQ` 和 `STRATA_MMQ_DIRECT` 两个 MMQ 相关变量。
+  upstream 的 `docs/DETAILS.md` 写得很直接：「The release builds have no MMQ」——
+  那套 prompt 专家的 MMQ kernel 是从 llama.cpp 派生的，upstream 在 0.2.16 整条移除。
+- **fork 仍然有**：`CMakeLists.txt:112` 保留
+  `option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels (CUDA; HIP together with STRATA_PREFILL_MMQ)" OFF)`，
+  加上 `STRATA_MMQ_KQUANTS=ON`、`STRATA_MMQ_TQ_OVERLAY=ON`（后者要 `third_party/strata-ggml` 的 ggml-cuda overlay）。
+  fork 的 `build-v100/CMakeCache.txt` 里 `STRATA_MMQ:BOOL=ON`。
+- **所以在上游 0.1.63 上加 `-DSTRATA_MMQ=ON` 没有意义**（选项不存在），想拿回 MMQ 的 prefill 速度
+  要把 fork 那套 llama.cpp overlay + MMQ prompt kernel **移植到新 engine 布局** —— 那是代码移植，不是配置项。
+- **上游给的新路是 fused int8 prompt experts（`STRATA_PF_FUSED=1`）**：
+  `docs/DETAILS.md` 记录它在 80+ SMs 的卡上覆盖 IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS 的 gate/up，
+  并可 `STRATA_PF_FUSED=1` 显式在其它卡上打开；**V100 是 70 SMs，属未验证区间**，需要实测。
+  本轮实测的 `STRATA_PF_WMMA=1`（V100 官方页推荐的 FP16 tensor-core prompt 专家）在本机 2108 tok 的
+  冷 prefill 上**没有收益**（761 / 761 / 755 tok/s 三臂一致）。
+
+**对决策的影响**：长 prompt 的 prefill 吞吐上，上游分支大概率弱于带 MMQ 的 fork（未做同 prompt 实测）。
+decode 侧本轮实测是上游 ≈ fork（见 §3）。如果生产负载以长 prompt 为主，fork 仍是更稳的一侧；
+上游分支的价值在于它是新代码、且 decode 与 fork 打平。
+
+## 7. 还没试的候选
 
 1. **`STRATA_MTP_STAGE0=1`**：引擎日志提示两段切分下草稿层不在首卡时 `--pipeline-windows 2`
    在别的机器上「lost to the serial loop」，要靠这个开关把草稿层放到首卡。
