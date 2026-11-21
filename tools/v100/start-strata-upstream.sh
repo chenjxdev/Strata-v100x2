@@ -23,12 +23,13 @@ PORT=8080
 
 pick_terminal() {
   local base="$HOME/.local/share/strata/terminal"
+  # SERVER_DIR is the terminal root: the script runs "serve/server.py" relative to it
   if [ -x "$base/current/python/bin/python3" ]; then
     TERMINAL_PY="$base/current/python/bin/python3"
-    SERVER_DIR="$base/current/serve"
+    SERVER_DIR="$base/current"
   else
     TERMINAL_PY="$base/0.1.49.2/python/bin/python3"
-    SERVER_DIR="$base/0.1.49.2/serve"
+    SERVER_DIR="$base/0.1.49.2"
   fi
 }
 
