@@ -42,10 +42,16 @@ do_start() {
   local cfg="$INSTALL_DIR/$name.json"
   [ -f "$cfg" ] || { echo "no such config: $cfg" >&2; exit 1; }
 
-  if ss -lnt 2>/dev/null | grep -q ":$PORT "; then
-    echo "port $PORT is busy - stop the other service first (strata / ninfer / ...)" >&2
-    exit 1
-  fi
+  # wait for the port: a service that was just stopped (a 20 GiB model's CUDA teardown
+  # takes seconds) still holds its socket for a moment
+  local waited=0
+  while ss -lnt 2>/dev/null | grep -q ":$PORT "; do
+    if [ "$waited" -ge 60 ]; then
+      echo "port $PORT is still busy after ${waited}s - stop the other service first (strata / ninfer / ...)" >&2
+      exit 1
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
 
   # RLIMIT_MEMLOCK: the 26.8 GiB PLE table has to be locked in RAM, otherwise the engine
   # can only lock 15.7 GiB and loses ~6-10% of decode speed (it says so itself).
