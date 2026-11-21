@@ -54,9 +54,10 @@ do_start() {
       echo "memlock: raised to unlimited"
     else
       echo "WARNING: RLIMIT_MEMLOCK is ${limit} KB, so the PLE table stays unlocked." >&2
-      echo "         decode loses ~6-10%. Fix with:" >&2
-      echo "           sudo prlimit --memlock=unlimited --pid \$\$   # then re-run this script" >&2
-      echo "         or run it from a systemd unit with LimitMEMLOCK=infinity." >&2
+      echo "         decode loses ~6-10%. The permanent fix is already installed on this box:" >&2
+      echo "           /etc/security/limits.d/99-memlock.conf   (chenjx - memlock unlimited;" >&2
+      echo "           it applies to every NEW login session - log out and back in)" >&2
+      echo "         or run this service from a systemd unit with LimitMEMLOCK=infinity." >&2
     fi
   fi
 
