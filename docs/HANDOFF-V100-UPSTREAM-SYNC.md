@@ -156,7 +156,31 @@ temperature 0，`max_tokens 256`。
 | 上游 `strata-upstream-sync/build/strata`（无 MMQ） | 官方三 shard 包 | **1677.2 tok/s** |
 | （参考）fork 生产配置 + UD 四 shard 包 | UD-IQ4_XS | 1693.8 tok/s |
 
-差 +0.3%，噪声内。**11-16 的「不带 `-DSTRATA_MMQ=ON` 重建掉 30% prefill」在当前上游代码/该包上不复现**
+差 +0.3%，噪声内。
+
+**2026-11-21 晚：MMQ 真的移植进上游并做了同二进制 A/B**（不再只是跨二进制比较）：
+
+- 移植范围：`moe_mmq.cu` / `moe_iq4_w4a8.cu` / `ggml_cuda_host.cu` / `mmq_nvfp4_w4a8.cu` 从 fork 搬进 `engine/src/prefill/`，
+  加 `strata_ggml_mmq_types()` + 精简版 `strata_cuda_mmq()`，打开 `-DSTRATA_MMQ=ON`（9 个 MMQ 实例：
+  q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0；不带 trellis/TAB/K-quant DSO/ORCA；
+  NVFP4 W4A4 单元需要 sm_120a，用空桩）。产物 `build-mmq/strata`（119 MB，比无 MMQ 的 90 MB 多 29 MB）。
+- 运行确认 MMQ 真的在跑：`strings` 里 1687 个 mmq 字样（无 MMQ 版 272），引擎日志出现 MMQ 独有的
+  `strata serve: the prompt path borrows 2308 CUDA0 cache slots (4.79 GiB)`。
+- 同配置、同包、同 prompt，只差二进制的 A/B：
+
+| 指标 | MMQ ON | MMQ OFF | 差 |
+| --- | --- | --- | --- |
+| prefill 17~18K 中位 | 1674.7 tok/s | 1676.2 tok/s | -0.1% |
+| prefill 均值 | 1673.4 | 1669.3 | +0.2% |
+| decode 中位 | 96.75 | 97.65 | -0.9% |
+| decode 均值 | 96.14 | 96.14 | 0 |
+| decode warm 中位 | 103.15 | 99.40 | +3.8%（噪声） |
+
+**结论：即使把 MMQ 移植进来，在这台 V100 + UD/官方 IQ4_XS 包上也没有收益。**
+移植代码留在 `/home/chenjx/strata-mmq-port.patch` + `strata-mmq-port-README.txt`（未应用到分支），
+工作树已还原为与 upstream 一致。
+
+**11-16 的「不带 `-DSTRATA_MMQ=ON` 重建掉 30% prefill」在当前上游代码/该包上不复现**
 （那次是 14K prompt + 当时的代码；上游这版把 FP16 prompt 路径做上来了）。
 结论：**不要把 fork 的 MMQ 路径移植到新 engine** —— 上游 `cmake/backends/cuda.cmake` 还专门加了
 `tools/check_no_mmq.py` 守门测试（二进制里出现 MMQ 符号即失败），移植等于跟上游的显式移除对着干，
