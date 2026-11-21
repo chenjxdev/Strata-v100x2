@@ -148,15 +148,26 @@ temperature 0，`max_tokens 256`。
     而本仓库 11-16 审计记录里的 fork 数据是「无 MMQ 1040-1091 / 有 MMQ 1595-1621 tok/s（14K）」——
     **上游这版的 prompt 吞吐已经不在 fork 之下**（口径/prompt 不同，要严格比较需同 prompt A/B）。
 
-**对决策的影响**：长 prompt 的 prefill 吞吐上，上游分支大概率弱于带 MMQ 的 fork（未做同 prompt 实测）。
-decode 侧本轮实测是上游 ≈ fork（见 §3）。如果生产负载以长 prompt 为主，fork 仍是更稳的一侧；
-上游分支的价值在于它是新代码、且 decode 与 fork 打平。
+**2026-11-21 实测：MMQ 在这台机器上没有收益**（同包、同 prompt，只差二进制）：
+
+| 二进制 | 模型包 | 17~18K prompt 冷 prefill 中位 |
+| --- | --- | --- |
+| fork `build-v100/strata`（MMQ=ON） | 官方三 shard 包 | **1682.4 tok/s** |
+| 上游 `strata-upstream-sync/build/strata`（无 MMQ） | 官方三 shard 包 | **1677.2 tok/s** |
+| （参考）fork 生产配置 + UD 四 shard 包 | UD-IQ4_XS | 1693.8 tok/s |
+
+差 +0.3%，噪声内。**11-16 的「不带 `-DSTRATA_MMQ=ON` 重建掉 30% prefill」在当前上游代码/该包上不复现**
+（那次是 14K prompt + 当时的代码；上游这版把 FP16 prompt 路径做上来了）。
+结论：**不要把 fork 的 MMQ 路径移植到新 engine** —— 上游 `cmake/backends/cuda.cmake` 还专门加了
+`tools/check_no_mmq.py` 守门测试（二进制里出现 MMQ 符号即失败），移植等于跟上游的显式移除对着干，
+而收益为零。除非换到 MMQ 确实更快的负载（K-quant 专家 / 其它芯片）再评估。
+
+decode 侧本轮实测也是上游 ≈ fork（见 §3）。
 
 ## 7. 还没试的候选
 
 0. ~~**`STRATA_PF_FUSED=1`**~~：已测，**V100 上无效**（CC 7.0 被门槛挡掉，见 §6）。
-1. **同 prompt 的上游 vs fork prefill 对比**：上游无 MMQ 的构建已经跑到 ~1670 tok/s（17~18K），
-   值得用同一份 prompt 对比 fork 的 MMQ 构建，确认「−30% prefill」这条 11-16 结论是否还成立。
+1. ~~同 prompt 的上游 vs fork prefill 对比~~：**已测，1682.4 vs 1677.2 tok/s，MMQ 无收益**（见 §6）。
 2. **`STRATA_MTP_STAGE0=1`**：引擎日志提示两段切分下草稿层不在首卡时 `--pipeline-windows 2`
    在别的机器上「lost to the serial loop」，要靠这个开关把草稿层放到首卡。
 3. **`--vram-elastic` / `--vram-segment-mib`**：upstream 替掉旧 reserve 机制；引擎还打印
