@@ -134,11 +134,19 @@ temperature 0，`max_tokens 256`。
   fork 的 `build-v100/CMakeCache.txt` 里 `STRATA_MMQ:BOOL=ON`。
 - **所以在上游 0.1.63 上加 `-DSTRATA_MMQ=ON` 没有意义**（选项不存在），想拿回 MMQ 的 prefill 速度
   要把 fork 那套 llama.cpp overlay + MMQ prompt kernel **移植到新 engine 布局** —— 那是代码移植，不是配置项。
-- **上游给的新路是 fused int8 prompt experts（`STRATA_PF_FUSED=1`）**：
-  `docs/DETAILS.md` 记录它在 80+ SMs 的卡上覆盖 IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS 的 gate/up，
-  并可 `STRATA_PF_FUSED=1` 显式在其它卡上打开；**V100 是 70 SMs，属未验证区间**，需要实测。
-  本轮实测的 `STRATA_PF_WMMA=1`（V100 官方页推荐的 FP16 tensor-core prompt 专家）在本机 2108 tok 的
-  冷 prefill 上**没有收益**（761 / 761 / 755 tok/s 三臂一致）。
+- **上游给的新路是 fused int8 prompt experts（`STRATA_PF_FUSED=1`），但在 V100 上用不了**（2026-11-21 实测）：
+  - 实测：17~18K token 的 prompt，两臂（不带 / 带 `STRATA_PF_FUSED=1`）prefill
+    **1656.6 / 1677.2 / 1697.8 vs 1663.5 / 1670.6 / 1697.2 tok/s** —— 差 -0.4%，纯噪声。
+  - 原因在源码里写死了：`engine/src/qwen35/q36_engine.cu:1418`
+    「... cards under 40 SMs and **compute capability below 8 are as before (MMQ)**」——
+    fused int8 prompt 专家只给 **CC ≥ 8**（sm_80+）的卡用，**V100 是 CC 7.0，开关被直接忽略**（引擎也不报警）。
+  - 也就是说：**在 V100 上，上游 0.1.63 既没有 MMQ、也没有 fused int8 专家**，
+    prompt 走的是分组 kernel / FP16 路径，这是上游的现状，不是配置能改的。
+  - 本轮实测的 `STRATA_PF_WMMA=1`（V100 官方页推荐的 FP16 tensor-core prompt 专家）**也没有 prefill 收益**
+    （2108 tok 冷 prefill：761 / 761 / 755 tok/s 三臂一致）。
+  - 附带一个值得注意的数据点：上游构建（**完全没有 MMQ**）在 17~18K token 上跑到 **~1670 tok/s**，
+    而本仓库 11-16 审计记录里的 fork 数据是「无 MMQ 1040-1091 / 有 MMQ 1595-1621 tok/s（14K）」——
+    **上游这版的 prompt 吞吐已经不在 fork 之下**（口径/prompt 不同，要严格比较需同 prompt A/B）。
 
 **对决策的影响**：长 prompt 的 prefill 吞吐上，上游分支大概率弱于带 MMQ 的 fork（未做同 prompt 实测）。
 decode 侧本轮实测是上游 ≈ fork（见 §3）。如果生产负载以长 prompt 为主，fork 仍是更稳的一侧；
@@ -146,8 +154,11 @@ decode 侧本轮实测是上游 ≈ fork（见 §3）。如果生产负载以长
 
 ## 7. 还没试的候选
 
-1. **`STRATA_MTP_STAGE0=1`**：引擎日志提示两段切分下草稿层不在首卡时 `--pipeline-windows 2`
+0. ~~**`STRATA_PF_FUSED=1`**~~：已测，**V100 上无效**（CC 7.0 被门槛挡掉，见 §6）。
+1. **同 prompt 的上游 vs fork prefill 对比**：上游无 MMQ 的构建已经跑到 ~1670 tok/s（17~18K），
+   值得用同一份 prompt 对比 fork 的 MMQ 构建，确认「−30% prefill」这条 11-16 结论是否还成立。
+2. **`STRATA_MTP_STAGE0=1`**：引擎日志提示两段切分下草稿层不在首卡时 `--pipeline-windows 2`
    在别的机器上「lost to the serial loop」，要靠这个开关把草稿层放到首卡。
-2. **`--vram-elastic` / `--vram-segment-mib`**：upstream 替掉旧 reserve 机制；引擎还打印
+3. **`--vram-elastic` / `--vram-segment-mib`**：upstream 替掉旧 reserve 机制；引擎还打印
    `--kv-grow is off (... no --vram-elastic ...)`，也就是配置里的 `STRATA_KV_GROW=1` 目前被层切分判成无效。
-3. **三个 decode opt-in 拆开单测**（这次是打包测的）。
+4. **三个 decode opt-in 拆开单测**（这次是打包测的）。
