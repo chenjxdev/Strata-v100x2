@@ -1,0 +1,20 @@
+# Production unit for the upstream build (memlock unlimited is what makes the PLE table
+# lockable; without it decode loses ~6-10%).  Not installed by default - copy it to
+# /etc/systemd/system/ and enable it if you want the service to survive a reboot.
+[Unit]
+Description=Strata upstream 0.1.63 on 2x V100 (SXM2-16GB)
+After=network.target
+
+[Service]
+Type=simple
+User=chenjx
+WorkingDirectory=/home/chenjx/.local/share/strata/terminal/0.1.49.2
+LimitMEMLOCK=infinity
+ExecStart=/home/chenjx/.local/share/strata/terminal/0.1.49.2/python/bin/python3 serve/server.py \
+  --engine strata --config /home/chenjx/.local/share/strata/install/strata-upstream-best.json \
+  --port 8080 --api-key chenjx-v100
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
