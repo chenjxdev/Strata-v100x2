@@ -658,6 +658,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         lk.fetched[i] = false;
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
+        map_.note(layer, e);   // the server's expert map (nothing until it asked)
         const int32_t s = res_[idx];
         lk.peer[i] = nullptr;
         if (s >= 0) {
@@ -678,6 +679,38 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
     }
     return true;
+}
+
+bool ExpertTier::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    if (n_layers_ <= 0 || n_expert_ <= 0) return false;
+    if (!map_.is_open()) {
+        const int64_t all = (int64_t) n_layers_ * n_expert_;
+        map_.open(n_layers_, n_expert_, all <= kMapAll ? (int) all : core::ExpertMapTally::kCells);
+    }
+    total = map_.total();
+    const std::vector<int32_t>& pairs = map_.pairs();
+    homes.resize(pairs.size());
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const Source s = locate(pairs[i] / n_expert_, pairs[i] % n_expert_);
+        const core::ExpertHome h = s.dev ? core::ExpertHome::Vram : s.peer ? core::ExpertHome::Peer
+                                 : s.pinned ? core::ExpertHome::Ram : core::ExpertHome::File;
+        homes[i] = (uint8_t) h;
+    }
+    map_.take(routed);
+    return true;
+}
+
+std::string ExpertTier::occupancy_words() const {
+    uint64_t one_each = 0;   // one expert of every layer
+    for (const ExpertLayer& el : m_.pack().experts) one_each += el.blob_bytes;
+    const auto tier = [&](const char* name, int64_t per_layer) {
+        return std::string(name) + "/" + std::to_string(per_layer) + "/" + std::to_string(((uint64_t) per_layer * one_each) >> 20);
+    };
+    const int64_t main = per_layer_ + ext_per_layer_;
+    return "expert_cache_mib=" + std::to_string(((uint64_t) main * one_each) >> 20) + " expert_tiers=" + tier("main", main) + "," +
+           tier("peer", homes_.peer) + "," + tier("ram", homes_.ram) + "," + tier("file", homes_.file) +
+           " expert_layers=" + std::to_string(n_layers_) + " experts_per_layer=" + std::to_string(n_expert_) +
+           (homes_.main == 0 ? " main_copies=1" : " main_copies=0");
 }
 
 ExpertTier::Source ExpertTier::locate(int layer, int e) const {

@@ -172,8 +172,11 @@ class _CpuRamFallback:
 # ------------------------------------------------------------------------------------------------ the sampler
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
             "pcie_rx_mb", "pcie_tx_mb")
-SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
-GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
+# the server's own figures (extra()): kept as history, not in the current reading; the experts_*_s ones are the decode's
+# expert lookups a second by where the expert lives (the engine's XMAP lines, Service.telemetry_extra; Lapilli)
+SPEEDS = ("tok_s", "prefill_tok_s_mean", "experts_vram_s", "experts_peer_s", "experts_ram_s", "experts_file_s")
+SERIES = SPEEDS + ("cpu", "disk_read_mb", "disk_write_mb")   # series kept as history (the machine's: Lapilli)
+GPU_SERIES = ("util", "power", "temp", "pcie_rx_mb", "pcie_tx_mb")   # per-card series kept as history
 
 
 def _r2(v):
@@ -187,7 +190,8 @@ class Telemetry:
         driver_version(), cuda_version()."""
         self.extra = extra
         self.lock = threading.Lock()
-        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
+        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None,
+                          "disk_write_mb": None}
         self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
         self.slot_hist = collections.deque(maxlen=HISTORY)     # per sample: each slot's tok/s
         self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
@@ -219,18 +223,20 @@ class Telemetry:
         return self._stopped.is_set()
 
     def _disk(self):
-        """Disk read MB/s since the last call; None without psutil or on the first call."""
+        """Disk read and write MB/s since the last call; (None, None) without psutil or on the first call."""
         if not self.ps:
-            return None
+            return None, None
         try:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
-            return None
+            return None, None
+        if c is None:                                   # no disk the OS counts
+            return None, None
         t = time.time()
-        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
+        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
         if prev is None or t <= prev[0]:
-            return None
-        return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20
+            return None, None
+        return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20, (c.write_bytes - prev[2]) / (t - prev[0]) / 2**20
 
     def sample(self):
         s = {"gpus": []}
@@ -251,7 +257,7 @@ class Telemetry:
         else:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
-        s["disk_read_mb"] = self._disk()
+        s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         if self.extra:
             try:
                 s.update(self.extra())
@@ -280,7 +286,7 @@ class Telemetry:
 
     def snapshot(self):
         with self.lock:
-            now = {k: v for k, v in self.now.items() if k not in SERIES and k != "slot_tok_s"}
+            now = {k: v for k, v in self.now.items() if k not in SPEEDS and k != "slot_tok_s"}
             hist = {k: list(v) for k, v in self.hist.items()}
             # one series per slot, oldest first; a sample from before a slot existed is None
             n = max((len(x) for x in self.slot_hist), default=0)

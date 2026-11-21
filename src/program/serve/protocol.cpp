@@ -278,6 +278,9 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    // the server's console figures (STATS, console_stats.hpp): a server sends STATS only to an engine that says it reads it
+    // (an older engine would take the line for a request). (Lapilli: upstream Basalt sends STATS unasked.)
+    std::printf("INFO console_stats=1\n");
     if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
         std::string flags;
         for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;

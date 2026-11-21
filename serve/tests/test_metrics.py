@@ -24,6 +24,10 @@ from serve.util.text import ByteTokenizer
 from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
 
+# the history /metrics sends: the speeds, the decode's expert lookups by home, the machine's load and disk, per slot, per card
+HISTORY_KEYS = {"tok_s", "prefill_tok_s_mean", "experts_vram_s", "experts_peer_s", "experts_ram_s", "experts_file_s",
+                "cpu", "disk_read_mb", "disk_write_mb", "slot_tok_s", "gpus"}
+
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 
 
@@ -76,7 +80,7 @@ class Http(unittest.TestCase):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
         self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
-                                 "history", "models", "swap"})
+                                 "history", "models", "swap", "experts_map", "experts_live", "experts"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
@@ -85,10 +89,10 @@ class Http(unittest.TestCase):
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
-        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "disk_write_mb"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(m["history"]), HISTORY_KEYS)
 
     def test_the_expert_total_is_reported_with_or_without_spill(self):
         self.engine.info = {"expert_slots": 24576, "spill_experts": 0, "spill_total": 24576, "spill_bytes": 0}
@@ -312,8 +316,8 @@ class PerGpu(unittest.TestCase):
         self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0"}, {"index": 1, "name": "Card 1"}])
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
-        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(snap["history"]), HISTORY_KEYS)
+        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "disk_write_mb"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
         tel = self.sampler(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,
@@ -322,7 +326,7 @@ class PerGpu(unittest.TestCase):
         for _ in range(70):
             tel.record(tel.sample())
         snap = tel.snapshot()
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(snap["history"]), HISTORY_KEYS)
         self.assertEqual(len(snap["history"]["tok_s"]), 60)
         self.assertEqual(snap["history"]["tok_s"][-1], 12.35)
         self.assertEqual(snap["history"]["slot_tok_s"], [[1.23] * 60, [0.0] * 60])     # one series per slot

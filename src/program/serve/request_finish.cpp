@@ -57,6 +57,7 @@ Flow Request::complete() {
         basalt::log::error("basalt", "%s", msg.c_str());
         std::printf("ERR %s\n", msg.c_str());
     }
+    runtime_.stats_tick(true, true);   // the request's last counts, ahead of its end, the map's too (Lapilli: as upstream Basalt)
     if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
     if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
                 (long long) produced_n,

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -149,6 +150,14 @@ public:
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
 
     void report(const char* tag) const;
+    /// The server's expert map (core/expert_map.hpp): every expert when there are at most kMapAll of them, else upstream's
+    /// 640-cell sample; each one's home (where locate() finds it) and its decode lookups since the last call. The first call
+    /// opens the count. (Lapilli: as upstream Basalt's ExpertTier::expert_map, commit ff0b978d, with the whole map added.)
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed);
+    static constexpr int64_t kMapAll = 8192;
+    /// INFO words for the page's occupancy figures: expert_cache_mib (the main card's expert slots) and expert_tiers
+    /// (main/peer/ram/file: experts per layer and MiB; main_copies=1 when the main card's slots copy RAM experts).
+    std::string occupancy_words() const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
     int64_t hits() const { return hits_; }
     int64_t lookups() const { return hits_ + cpu_; }
@@ -243,6 +252,7 @@ private:
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
     bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
+    core::ExpertMapTally map_;              ///< the server's expert map count, open once it asked (expert_map)
     uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither

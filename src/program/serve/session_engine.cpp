@@ -283,6 +283,14 @@ public:
     bool slots_share_cells() const override { return false; }
     int64_t slot_context(int) const override { return o.max_context; }
     bool slot0_solo() const override { return o.batch > 0; }
+    // the console's expert figures (console_stats.hpp), from the solo session (Lapilli: as upstream Basalt, ff0b978d)
+    LookupCounts lookup_counts() override {
+        const basalt::model::ModelSession::ExpertCounts c = sessions_[0]->expert_counts();
+        return {c.hits, c.lookups, c.offloaded, c.files};
+    }
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        return sessions_[0]->expert_map(total, homes, routed);
+    }
 
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
@@ -705,6 +713,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     BSlot& sl = bs[(size_t) b];
     set_active(b);
     const int T = w.T;
+    const int64_t sent0 = sl.produced;   // the console's tokens of this window (stats_window below)
     std::vector<int32_t>& win_ = w.win;
     std::vector<int32_t>& out_ = w.out;
     int a = 0;
@@ -744,6 +753,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
+    stats_window(b, T - 1, a, (int) (sl.produced - sent0));
     sl.n_dr = 0;
     w.a = a;
     w.line = line;
@@ -807,8 +817,10 @@ bool SessionRuntime::next_batch_window() {
             set_active(b);
             w.round0 = Clock::now();
             slot_window_begin(b, w, 1 << 20);
+            stats_lookups_begin();
             if (const basalt::model::Result r = session().decode_window(w.d); !r.ok()) return failed(r.message);
             if (!slot_window_finish(b, w)) return false;
+            stats_lookups_end();
         }
         set_active(0);
         return true;
@@ -823,6 +835,7 @@ bool SessionRuntime::next_batch_window() {
     }
     for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
         const Clock::time_point t0 = Clock::now();
+        stats_lookups_begin();
         if (group.size() == 1) {
             if (const basalt::model::Result r = sessions_[(size_t) act[group[0]]]->decode_window(wins[group[0]].d); !r.ok()) return failed(r.message);
         } else {
@@ -855,6 +868,7 @@ bool SessionRuntime::next_batch_window() {
             if (!r.ok() && r.status != basalt::model::Status::NotImplemented) return failed(r.message);
             for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
+        stats_lookups_end();
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
     }

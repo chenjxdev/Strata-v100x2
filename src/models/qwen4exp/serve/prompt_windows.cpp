@@ -27,6 +27,13 @@ bool QfnRequest::read_windows(int64_t a, int64_t b, std::string& e) {
         explicit NoHeadSampling(basalt::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
         ~NoHeadSampling() { v.set_head_sampling(true); }
     } no_head_sampling(runtime_.ver);
+    // the server's expert map counts the decode only (Lapilli): its tally comes back as the read ends, whichever way
+    struct NoExpertMap {
+        basalt::core::ExpertMapTally*& m;
+        basalt::core::ExpertMapTally& tally;
+        NoExpertMap(basalt::core::ExpertMapTally*& x, basalt::core::ExpertMapTally& t) : m(x), tally(t) { m = nullptr; }
+        ~NoExpertMap() { m = tally.is_open() ? &tally : nullptr; }
+    } no_expert_map(runtime_.drive.d.map, runtime_.map_tally_);
     std::vector<int32_t> win((size_t) runtime_.S), outw((size_t) runtime_.S), nxt((size_t) runtime_.S);
     for (int64_t q = a; q < b;) {
         if (runtime_.halted()) { e = "cancelled"; return false; }

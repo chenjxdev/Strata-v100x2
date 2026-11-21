@@ -373,7 +373,15 @@ public:
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill()) +
+                                   " " + t->occupancy_words();
+    }
+
+    // the server's expert map (Lapilli: as upstream Basalt, commit ff0b978d)
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        std::string e;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        return t != nullptr && t->expert_map(total, homes, routed);
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

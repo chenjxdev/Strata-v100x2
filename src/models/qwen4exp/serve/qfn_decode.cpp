@@ -146,6 +146,7 @@ inline int QfnRequest::before_window(int T, int64_t) {
         // applied beside the draft before it (apply_thr) when their copies are done; what that moved to the
         // peer lands one window later
         if (apply_thr.joinable()) apply_thr.join();
+        runtime_.map_writer_live = false;   // nothing writes the residency tables beside the map now (Lapilli)
         if (copy_live && copy_done) {   // the RAM copies are done: their bookkeeping, between windows
             basalt::core::decode_events().tag(1u << 3);
             runtime_.src.commit_exchanges();
@@ -246,6 +247,7 @@ inline void QfnRequest::tier_after_commit() {
                     copy_done = false;
                 }
                 basalt::core::decode_events().tag(1u << 2);
+                runtime_.map_writer_live = true;   // the map keeps its last homes until the next join (Lapilli)
                 apply_thr.run([&, boundary, copies] {
                     if (boundary) {
                         runtime_.apply_pending(true, false);
@@ -475,8 +477,10 @@ inline void QfnRequest::window_timing(int T, int a, bool from_sfx, Clock::time_p
 
 void QfnRequest::decode_end() {
     if (apply_thr.joinable()) apply_thr.join();
+    runtime_.map_writer_live = false;
     if (copy_live) runtime_.src.commit_exchanges();   // swaps applied early: the rest of their copies
     copy_live = false;
+    if (runtime_.drive.d.map != nullptr) runtime_.map_tiers_info();   // the map's tiers, if this request moved them (Lapilli)
 }
 
 Flow QfnRequest::decode() { return decode_loop(*this); }

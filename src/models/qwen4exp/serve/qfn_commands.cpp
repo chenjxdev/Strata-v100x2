@@ -169,6 +169,93 @@ void QfnRuntime::print_info() {
     }
 }
 
+// ---- the server's console figures (STATS, src/program/serve/console_stats.hpp; Lapilli) ----
+// DONE's expert counts (QfnRequest::done_counts), from the engine's start: the console takes their differences.  One
+// dispatch counts every path and every stage (ExpertDispatch, engine_local.hpp); `offloaded` is PCIe and the peer cards.
+LookupCounts QfnRuntime::lookup_counts() {
+    const basalt::core::ExpertDispatch& d = drive.d;
+    return {d.cache_hits, d.cache_hits + d.cache_admitted + d.cache_refused, d.offload_entries, src.file_reads()};
+}
+
+// Where (layer, expert) is computed now, as the map draws it (core::ExpertHome): a slot of the stage that owns the layer
+// (host_res: GPU 0, or another card in a layer split), then a peer card, then RAM (the arena holds every expert; the
+// mmap source its complement and top-up), else the pack file - report_expert_tiers' order.  Never the ExpertCache tables:
+// they are filled at start only.  On the main thread, between windows (see map_writer_live).
+uint8_t QfnRuntime::map_home(int64_t layer, int64_t expert) const {
+    using basalt::core::ExpertHome;
+    const size_t i = (size_t) (layer * g.n_expert + expert);
+    if (i < host_res.size() && host_res[i] >= 0)
+        return (uint8_t) (multi_gpu && stage_of && stage_of(layer) > 0 ? ExpertHome::Peer : ExpertHome::Vram);
+    if (peer.valid() && peer.has(layer, expert)) return (uint8_t) ExpertHome::Peer;
+    for (const auto& xpe : xpeers)
+        if (xpe->valid() && xpe->has(layer, expert)) return (uint8_t) ExpertHome::Peer;
+    if (srcp != nullptr && srcp != &src) return (uint8_t) ExpertHome::Ram;   // the arena: every expert in RAM
+    if (srcp == &src && src.complement_ready() && src.has_resident(layer, expert)) return (uint8_t) ExpertHome::Ram;
+    return (uint8_t) ExpertHome::File;
+}
+
+// The map's tiers for the server (serve/engine/console.py expert_tiers): each card keeps one pool for every layer, so the
+// tiers are given in all - GPU 0 as its places (the cache's live slots, free ones too) and their MiB, the others as the
+// experts they hold now and those experts' MiB - with the map's rows.  Printed once the tiers are final (init_memory)
+// and again, between requests, when they changed (the adaptive tier and the elastic VRAM move them).
+void QfnRuntime::map_tiers_info() {
+    const int64_t L = g.n_layers, NE = g.n_expert;
+    if (L <= 0 || NE <= 0) return;
+    int64_t n[4] = {0, 0, 0, 0};
+    uint64_t b[4] = {0, 0, 0, 0};
+    for (int64_t l = 0; l < L; ++l) {
+        const uint64_t blob = basalt::kernels::cpu::expert_layout().blob_bytes(l);
+        for (int64_t e = 0; e < NE; ++e) {
+            const uint8_t h = map_home(l, e);
+            ++n[h];
+            b[h] += blob;
+        }
+    }
+    char facts[320];
+    std::snprintf(facts, sizeof facts,
+                  "INFO expert_tiers_total=main/%lld/%lld,peer/%lld/%lld,ram/%lld/%lld,file/%lld/%lld expert_layers=%lld "
+                  "experts_per_layer=%lld\n",
+                  (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), (long long) n[1], (long long) (b[1] >> 20),
+                  (long long) n[2], (long long) (b[2] >> 20), (long long) n[3], (long long) (b[3] >> 20), (long long) L,
+                  (long long) NE);
+    if (map_tiers_sent_ == facts) return;
+    map_tiers_sent_ = facts;
+    std::fputs(facts, stdout);
+    std::fflush(stdout);
+}
+
+// The server's expert map: every expert (48 x 512 = 24,576 for the Flash-Next, within the tally's int16 index), counted
+// from the first call (the server's STATS) at the dispatch's single per-entry decision (expert_dispatch.cpp).  Layers a
+// zero-doorbell stage serves (one holding every expert of its layers) never reach the dispatch: neither DONE's counts nor
+// the map see them - out of reach of the Flash-Next on two 32 GB cards.
+bool QfnRuntime::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    const int64_t L = g.n_layers, NE = g.n_expert;
+    if (L <= 0 || NE <= 0) return false;
+    if (!map_tally_.is_open()) {
+        const int64_t all = L * NE;
+        map_tally_.open((int) L, (int) NE, all <= kMapAll ? (int) all : basalt::core::ExpertMapTally::kCells);
+        drive.d.map = &map_tally_;
+    }
+    total = map_tally_.total();
+    const std::vector<int32_t>& pairs = map_tally_.pairs();
+    // apply_thr may be landing a layer split's residency swaps beside the window: the homes read last, until it is joined
+    // (the first reading is at the server's STATS, on an idle engine)
+    if (!map_writer_live || map_homes_.size() != pairs.size()) {
+        map_homes_.resize(pairs.size());
+        if ((int64_t) pairs.size() == L * NE) {   // the whole map: pair i is expert i, layer by layer
+            size_t i = 0;
+            for (int64_t l = 0; l < L; ++l)
+                for (int64_t e = 0; e < NE; ++e) map_homes_[i++] = map_home(l, e);
+        } else {
+            for (size_t i = 0; i < pairs.size(); ++i) map_homes_[i] = map_home(pairs[i] / NE, pairs[i] % NE);
+        }
+    }
+    homes = map_homes_;
+    map_tally_.take(routed);
+    if (map_tiers_sent_.empty()) map_tiers_info();
+    return true;
+}
+
 Flow QfnRuntime::run_request() {
     QfnRequest request(*this);
     return request.execute();

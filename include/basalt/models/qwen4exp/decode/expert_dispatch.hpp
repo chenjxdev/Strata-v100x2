@@ -8,6 +8,7 @@
 namespace basalt::core {
 
 class PeerExperts;
+class ExpertMapTally;
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing.
 struct ExpertDispatch {
@@ -32,6 +33,9 @@ struct ExpertDispatch {
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
+    /// The server's expert map (core/expert_map.hpp, STATS): one note per routed entry of a decode window, every kind and
+    /// every stage; null until the server asks, and while a prompt is read through verify windows (Lapilli).
+    ExpertMapTally* map = nullptr;
     void* cache_stream = nullptr;
     const char* cache_fail = nullptr;
 

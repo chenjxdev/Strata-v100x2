@@ -21,6 +21,7 @@
   }
 </script>
 <script defer src="web/marked.umd.js"></script>
+<script defer src="web/lapilli-monitor.js"></script>
 <script defer src="web/lapilli.js"></script>
 </head>
 <body>
@@ -35,6 +36,8 @@
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-discussion"/></svg><span>Chat</span></button>
     <button class="onglet" role="tab" id="onglet-moniteur" data-vue="moniteur" aria-controls="vue-moniteur" aria-selected="false">
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-moniteur"/></svg><span>Monitor</span></button>
+    <button class="onglet" role="tab" id="onglet-experts" data-vue="experts" aria-controls="vue-experts" aria-selected="false" hidden>
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-experts"/></svg><span>Experts</span></button>
     <button class="onglet" role="tab" id="onglet-apropos" data-vue="apropos" aria-controls="vue-apropos" aria-selected="false">
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-info"/></svg><span>About</span></button>
   </nav>
@@ -111,61 +114,199 @@
   <!-- ================================ Monitor ================================ -->
   <section class="vue vue--defile" id="vue-moniteur" role="tabpanel" aria-labelledby="onglet-moniteur" hidden>
     <div class="moniteur">
-      <div class="carte etat-carte">
-        <div class="etat-carte__haut">
-          <div class="etat-carte__titre">
-            <span class="carte__titre">Model status</span>
-            <span class="etat-carte__libelle" id="etat-libelle">Waiting for a question</span>
-          </div>
-          <span class="badges" id="etat-badges">
-            <span class="badge" data-b="repos">Idle</span>
-            <span class="badge badge--lecture" data-b="lecture">Reading</span>
-            <span class="badge badge--reflexion" data-b="reflexion">Thinking</span>
-            <span class="badge badge--ecriture" data-b="ecriture">Writing</span>
-            <span class="badge badge--attente" data-b="attente">Waiting</span>
-          </span>
-        </div>
-        <div class="etat-carte__detail" id="etat-detail">&nbsp;</div>
-        <div class="barre" id="etat-barre"><div class="barre__plein" id="etat-plein"></div></div>
+      <div class="sous-onglets" id="sous-onglets" role="tablist" aria-label="Monitor sections">
+        <button class="sous-onglet" role="tab" type="button" id="so-apercu" data-sous="apercu" aria-controls="sv-apercu" aria-selected="true">Overview</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-requetes" data-sous="requetes" aria-controls="sv-requetes" aria-selected="false">Requests</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-creneaux" data-sous="creneaux" aria-controls="sv-creneaux" aria-selected="false">Slots</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-materiel" data-sous="materiel" aria-controls="sv-materiel" aria-selected="false">Hardware</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-journal" data-sous="journal" aria-controls="sv-journal" aria-selected="false">Logs</button>
       </div>
 
-      <div class="tuiles" id="tuiles"></div>
-
-      <div class="moniteur__rang">
-        <div class="carte contexte-carte">
-          <span class="carte__titre">Context and experts</span>
-          <div class="jauge-bloc">
-            <svg class="jauge" viewBox="0 0 120 120" aria-hidden="true">
-              <circle class="jauge__piste" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="jauge__plein" id="ctx-plein" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
-            </svg>
-            <div class="jauge__texte"><span class="jauge__pct" id="ctx-pct">0%</span><span class="doux" id="ctx-sous">–</span></div>
+      <!-- Overview -->
+      <div class="sous-vue" id="sv-apercu" role="tabpanel" aria-labelledby="so-apercu">
+        <div class="carte etat-carte">
+          <div class="etat-carte__haut">
+            <div class="etat-carte__titre">
+              <span class="carte__titre">Model status</span>
+              <span class="etat-carte__libelle" id="etat-libelle">Waiting for a question</span>
+            </div>
+            <span class="badges" id="etat-badges">
+              <span class="badge" data-b="repos">Idle</span>
+              <span class="badge badge--lecture" data-b="lecture">Reading</span>
+              <span class="badge badge--reflexion" data-b="reflexion">Thinking</span>
+              <span class="badge badge--ecriture" data-b="ecriture">Writing</span>
+              <span class="badge badge--attente" data-b="attente">Waiting</span>
+            </span>
           </div>
-          <div class="ligne-barre"><span>Experts on the GPUs</span><span class="doux" id="experts-texte">–</span></div>
-          <div class="barre"><div class="barre__plein" id="experts-plein"></div></div>
-          <div class="ligne-barre"><span>Where the experts run</span><span class="doux" id="repartition-note">last response</span></div>
-          <div class="repartition" id="repartition" aria-hidden="true"></div>
-          <div class="repartition-legende" id="repartition-legende"></div>
-          <div class="records" id="records"></div>
+          <div class="etat-carte__detail" id="etat-detail">&nbsp;</div>
+          <div class="barre" id="etat-barre"><div class="barre__plein" id="etat-plein"></div></div>
+        </div>
+
+        <div class="vitesses">
+          <div class="carte vitesse-carte">
+            <div class="carte__tete"><span class="carte__titre">Writing</span><span class="doux petit" id="vc-ecr-note"></span></div>
+            <div class="vitesse__chiffre"><span class="vitesse__valeur" id="vv-ecr">–</span><span class="vitesse__unite" id="vu-ecr">tokens/s</span></div>
+            <div class="vitesse__sous" id="vs-ecr"></div>
+            <div class="graphe" id="g-ecr"></div>
+          </div>
+          <div class="carte vitesse-carte">
+            <div class="carte__tete"><span class="carte__titre">Reading</span><span class="doux petit" id="vc-lec-note"></span></div>
+            <div class="vitesse__chiffre"><span class="vitesse__valeur vitesse__valeur--lecture" id="vv-lec">–</span><span class="vitesse__unite" id="vu-lec">tokens/s</span></div>
+            <div class="vitesse__sous" id="vs-lec"></div>
+            <div class="graphe" id="g-lec"></div>
+          </div>
+        </div>
+
+        <div class="tuiles" id="tuiles"></div>
+
+        <div class="apercu__rang">
+          <div class="carte contexte-carte">
+            <span class="carte__titre">Context</span>
+            <div class="jauge-bloc">
+              <svg class="jauge" viewBox="0 0 120 120" aria-hidden="true">
+                <circle class="jauge__piste" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                        stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                <circle class="jauge__plein" id="ctx-plein" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                        stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              </svg>
+              <div class="jauge__texte"><span class="jauge__pct" id="ctx-pct">0%</span><span class="doux" id="ctx-sous">–</span></div>
+            </div>
+            <dl class="liste-faits" id="cache-faits"></dl>
+          </div>
+          <div class="carte derniere-carte">
+            <div class="carte__tete"><span class="carte__titre">Last response</span><span class="doux petit" id="derniere-quand"></span></div>
+            <dl class="liste-faits" id="derniere-faits"></dl>
+            <div class="ligne-barre"><span>Where its experts ran</span><span class="doux" id="derniere-part-note"></span></div>
+            <div class="repartition" id="repartition" aria-hidden="true"></div>
+            <div class="repartition-legende" id="repartition-legende"></div>
+          </div>
+          <div class="carte records-carte">
+            <div class="carte__tete"><span class="carte__titre">Records and totals</span><span class="doux petit" id="totaux-depuis"></span></div>
+            <div class="records" id="records"></div>
+            <dl class="liste-faits" id="totaux-faits"></dl>
+          </div>
+        </div>
+      </div>
+
+      <!-- Requests -->
+      <div class="sous-vue" id="sv-requetes" role="tabpanel" aria-labelledby="so-requetes" hidden>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Waiting for a slot</span><span class="doux petit" id="attente-nombre"></span></div>
+          <div class="file-attente" id="file-attente"></div>
         </div>
         <div class="carte requetes-carte">
           <div class="carte__tete"><span class="carte__titre">Recent responses</span><span class="doux petit" id="requetes-nombre"></span></div>
           <div class="table-defile">
-            <table class="table">
-              <thead><tr><th>Time</th><th>Finish</th><th class="num" title="Tokens of the message read by the model">Message</th>
-                <th class="num" title="Tokens reused from the cache: they were not read again">Reused</th><th class="num">Written</th>
-                <th class="num" title="Tokens read per second, for a message of at least 256 tokens (reused tokens excluded)">Reading</th>
-                <th class="num" title="Tokens written per second">Writing</th><th class="num">Duration</th></tr></thead>
-              <tbody id="requetes-corps"><tr><td colspan="8" class="doux">No responses yet</td></tr></tbody>
+            <table class="table table-requetes" id="table-requetes">
+              <thead><tr><th>Time</th><th class="c-num" title="The response's number since the server started">#</th><th class="c-creneau">Slot</th>
+                <th class="c-point">Endpoint</th><th>Finish</th>
+                <th class="num c-msg" title="Tokens of the message read by the model">Message</th>
+                <th class="num c-reut" title="Tokens reused from the cache: they were not read again">Reused</th><th class="num c-ecrit">Written</th>
+                <th class="num c-lec" title="Tokens read per second, for a message of at least 256 tokens (reused tokens excluded)">Reading</th>
+                <th class="num" title="Tokens written per second">Writing</th>
+                <th class="num c-pj" title="Time to the first written token">First token</th><th class="num c-duree">Duration</th></tr></thead>
+              <tbody id="requetes-corps"><tr><td colspan="12" class="doux">No responses yet</td></tr></tbody>
             </table>
           </div>
-          <p class="doux petit totaux" id="totaux"></p>
+        </div>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Tokens per response</span><span class="legende" id="jetons-legende"></span></div>
+          <div class="colonnes" id="g-jetons"></div>
         </div>
       </div>
+
+      <!-- Slots -->
+      <div class="sous-vue" id="sv-creneaux" role="tabpanel" aria-labelledby="so-creneaux" hidden>
+        <div class="creneaux" id="creneaux"><div class="carte vide doux">Reading the slots…</div></div>
+      </div>
+
+      <!-- Hardware -->
+      <div class="sous-vue" id="sv-materiel" role="tabpanel" aria-labelledby="so-materiel" hidden>
+        <div class="materiel" id="materiel-cartes"></div>
+        <div class="materiel-machine" id="materiel-machine"></div>
+        <p class="doux petit materiel__pied" id="materiel-pied"></p>
+      </div>
+
+      <!-- Logs -->
+      <div class="sous-vue" id="sv-journal" role="tabpanel" aria-labelledby="so-journal" hidden>
+        <div class="carte journal-carte">
+          <div class="journal__barre">
+            <div class="segments segments--petit" id="journal-filtre" role="radiogroup" aria-label="Lines shown">
+              <button type="button" role="radio" data-v="tout" aria-checked="true">All</button><button type="button" role="radio" data-v="alertes" aria-checked="false">Warnings and errors</button>
+            </div>
+            <span class="doux petit" id="journal-nombre"></span>
+            <span class="journal__espace"></span>
+            <div class="bascule-ligne bascule-ligne--petit"><span>Follow</span>
+              <button class="bascule" id="journal-suivre" type="button" role="switch" aria-checked="true" aria-label="Follow the newest lines"></button></div>
+          </div>
+          <div class="journal" id="journal" role="log" aria-label="Server and engine log" tabindex="0"></div>
+          <button class="btn btn--doux btn--petit journal__dernier" id="journal-dernier" type="button" hidden>
+            <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-bas"/></svg>Jump to latest</button>
+        </div>
+      </div>
+
       <p class="moniteur__pied doux petit"><span>Updated every second from the Lapilli server.</span>
         <a href="dashboard" target="_blank" rel="noopener" class="lien-externe">Basalt's detailed dashboard<svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-externe"/></svg></a></p>
+    </div>
+  </section>
+
+  <!-- ================================ Experts ================================ -->
+  <section class="vue vue--defile" id="vue-experts" role="tabpanel" aria-labelledby="onglet-experts" hidden>
+    <div class="moniteur experts">
+      <div class="carte experts-tete">
+        <div class="experts-tete__haut">
+          <div class="experts-tete__titre"><span class="carte__titre">Experts</span><p class="doux" id="ex-resume">&nbsp;</p></div>
+          <span class="badge" id="ex-etat"></span>
+        </div>
+        <div class="kpis" id="ex-kpis"></div>
+      </div>
+
+      <div class="carte ex-carte-carte">
+        <div class="carte__tete">
+          <span class="carte__titre">Expert map</span>
+          <div class="segments segments--petit" id="ex-mode" role="radiogroup" aria-label="What the colors show">
+            <button type="button" role="radio" data-v="vivant" aria-checked="true">Live</button><button type="button" role="radio" data-v="place" aria-checked="false">Placement</button><button type="button" role="radio" data-v="activite" aria-checked="false">Activity</button>
+          </div>
+        </div>
+        <div class="ex-legende" id="ex-legende"></div>
+        <div class="ex-carte" id="ex-carte"><canvas id="ex-canevas"></canvas></div>
+        <p class="doux petit ex-note" id="ex-note"></p>
+      </div>
+
+      <div class="experts__rang">
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Lookups per second</span><span class="doux petit" id="ex-flux-note"></span></div>
+          <div class="legende" id="ex-flux-legende"></div>
+          <div class="graphe" id="g-experts"></div>
+        </div>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Where the experts are kept</span><span class="doux petit" id="ex-occ-note"></span></div>
+          <div class="occupation" id="ex-occupation"></div>
+        </div>
+      </div>
+
+      <div class="carte">
+        <div class="carte__tete"><span class="carte__titre">By layer</span><span class="doux petit" id="ex-couches-note"></span></div>
+        <div class="legende" id="ex-couches-legende"></div>
+        <div class="couches" id="ex-couches"></div>
+      </div>
+
+      <div class="experts__rang">
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Busiest experts</span><span class="doux petit" id="ex-top-note"></span></div>
+          <div class="table-defile">
+            <table class="table">
+              <thead><tr><th>Layer</th><th>Expert</th><th>Kept on</th><th class="num" title="Lookups per second, over the last second">Now</th>
+                <th class="num" title="Recent lookups, fading by 15% a second">Recent</th></tr></thead>
+              <tbody id="ex-top"><tr><td colspan="5" class="doux">No lookups yet</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="carte ex-aide">
+          <span class="carte__titre">How to read this page</span>
+          <div class="ex-aide__corps" id="ex-aide"></div>
+        </div>
+      </div>
     </div>
   </section>
 

@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from serve.engine.console import expert_tiers
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
@@ -539,7 +540,27 @@ class Service:
     def telemetry_extra(self) -> dict:
         """This model's speeds, for the hardware sampler behind GET /metrics."""
         return {"tok_s": self._tok_s(), "prefill_tok_s_mean": self._prefill_tok_s_mean(),
-                "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]}
+                "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]], **self._expert_rates()}
+
+    def _expert_summary(self) -> dict | None:
+        """The expert map in a few numbers, for every /metrics: all the experts, the map's cells, the experts kept in each
+        home (VRAM, the other card, RAM, the file) and the decode's lookups a second served from each, the sample's
+        figures scaled to all the experts when the map holds a sample; None without a map (Lapilli)."""
+        console = getattr(self.engine, "console", None)
+        s = console.summary() if console is not None and self.loaded() and hasattr(console, "summary") else None
+        if not s or not s["cells"]:
+            return None
+        scale = s["total"] / s["cells"]
+        return {"total": s["total"], "cells": s["cells"], "homes": [round(h * scale) for h in s["kept"]],
+                "lookups_s": [round(v * scale, 1) for v in s["lookups_s"]]}
+
+    def _expert_rates(self) -> dict:
+        """The decode's expert lookups a second by where each expert lives now (the history's series); {} without a
+        map (Lapilli)."""
+        s = self._expert_summary()
+        if not s:
+            return {}
+        return dict(zip(("experts_vram_s", "experts_peer_s", "experts_ram_s", "experts_file_s"), s["lookups_s"]))
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
@@ -614,17 +635,27 @@ class Service:
             last = {k: dict(v) for k, v in self.slot_last.items()}
         reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
         progress = getattr(self.engine, "progress", None)
+        console = getattr(self.engine, "console", None)
+        with self.status_lock:      # each slot's last request's start, for an idle slot's console figures
+            last_start = {}
+            for r in self.history:
+                if r.get("slot") is not None:
+                    last_start[r["slot"]] = r["time"]
         rows = []
         for i in range(total):
             held = dict(last.get(i, {}))
             bd = (getattr(self.engine, "slot_drafts", None) or {}).get(i)
             if bd and bd[2] >= held.get("at", 0):      # a batch slot's own counts, when newer than a solo request's
                 held.update(accepted=bd[0], offered=bd[1])
+            # the engine's own figures of the slot's current or last request (STATS; Lapilli: as upstream Basalt)
+            cons = console.slot(i, by_slot[i][0].get("started") if i in by_slot else last_start.get(i)) \
+                if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None}
             row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
                    "api": None, "model": None, "tok_s": 0.0, "generated": 0, "max_tokens": None, "prompt_tokens": 0,
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
-                   "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+                   "drafts_accepted": held.get("accepted"),       # draft counts are the slot's last finished request's
+                   "started": None, "path": None, **cons}
             if i in by_slot:
                 st, rate = by_slot[i]
                 prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
@@ -636,12 +667,17 @@ class Service:
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
-                           draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None)
+                           draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None,
+                           started=st.get("started"), path=st.get("path"),
+                           # a running request's own drafts (the engine's XSLOT counts), none before its first window
+                           drafts_offered=row.get("drafts_offered") if console is None or "drafts_offered" in cons else None,
+                           drafts_accepted=row.get("drafts_accepted") if console is None or "drafts_accepted" in cons else None)
             rows.append(row)
         return rows, queue
 
-    def metrics(self) -> dict:
-        """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
+    def metrics(self, full_map: bool = False) -> dict:
+        """GET /metrics: engine facts, live state, recent requests, hardware and speed history.  `full_map`: the expert
+        map's arrays too (/metrics?experts=full, the Experts tab: tens to hundreds of KB); always its summary."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel: the newest request
@@ -682,8 +718,13 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
+        console = getattr(self.engine, "console", None)
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
+                # the engine's expert map (STATS; as upstream Basalt) and its tiers' occupancy (Lapilli)
+                "experts_map": console.expert_map() if full_map and console is not None and self.loaded() else None,
+                "experts_live": self._expert_summary(),
+                "experts": expert_tiers(info),
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
 
     def _drop_stale_best(self) -> None:
@@ -1241,7 +1282,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, slot=None, reused=None,
+                                  max_tokens=max_new, slot=None, reused=None, path=path,
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
                         if par:

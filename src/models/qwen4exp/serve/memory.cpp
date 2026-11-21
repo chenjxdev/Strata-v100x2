@@ -240,6 +240,7 @@ int QfnRuntime::init_memory() {
         }
     }
     report_expert_tiers();
+    map_tiers_info();   // the server's expert map: its tiers in all (Lapilli)
     // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
     // request stops only once the RAM is critical.  The checkpoints stay through a shed: a live request's rewind and
     // the deferred copy in flight use them.

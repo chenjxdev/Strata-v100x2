@@ -1,4 +1,5 @@
 // src/models/qwen4exp/decode/expert_dispatch.cpp - the pool's side of a layer: which routed experts go where.
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -249,6 +250,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
+            if (d.map != nullptr) d.map->note((int) d.layers, (int) e);   // the server's expert map (Lapilli)
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;   // PCIe or another GPU

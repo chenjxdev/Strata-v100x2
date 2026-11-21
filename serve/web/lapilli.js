@@ -104,17 +104,22 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   if (garde !== "dark" && garde !== "light") poserTheme(e.matches ? "dark" : "light", false);
 });
 
-const VUES = ["discussion", "moniteur", "apropos"];
+const VUES = ["discussion", "moniteur", "experts", "apropos"];
 let vue = "discussion";
 function montrerVue(nom) {
-  vue = VUES.includes(nom) ? nom : "discussion";
+  const [v, sous] = String(nom || "").split("/");     // #moniteur/requetes: the Monitor, on its Requests section
+  vue = VUES.includes(v) ? v : "discussion";
   for (const b of document.querySelectorAll(".onglet")) b.setAttribute("aria-selected", String(b.dataset.vue === vue));
-  for (const v of VUES) $(`vue-${v}`).hidden = v !== vue;
+  for (const x of VUES) $(`vue-${x}`).hidden = x !== vue;
   $("btn-panneau").hidden = vue !== "discussion";
-  const h = vue === "discussion" ? "" : `#${vue}`;
+  Moniteur.cacherBulle();
+  if (vue === "moniteur") Moniteur.montrerSousVue(sous || Moniteur.sousVue(), false);   // without one, the last section seen
+  const so = Moniteur.sousVue();
+  const h = vue === "discussion" ? "" : vue === "moniteur" && so !== "apercu" ? `#moniteur/${so}` : `#${vue}`;
   if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
   if (vue === "discussion" && !estTactile()) $("saisie").focus();
   if (mesures) dessinerMesures(mesures);
+  if (vue === "experts" && mesures && !mesures.experts_map) relever();   // its map now, not at the next reading
 }
 for (const b of document.querySelectorAll(".onglet")) b.onclick = () => montrerVue(b.dataset.vue);
 window.addEventListener("hashchange", () => montrerVue(location.hash.slice(1)));
@@ -191,7 +196,8 @@ async function relever() {
   releveEnVol = true;
   clearTimeout(minuterieReleve);
   try {
-    const r = await fetch("metrics", {cache: "no-store", headers: entetes()});
+    // the expert map's arrays only for the Experts tab (24,576 experts make hundreds of KB): a summary otherwise
+    const r = await fetch(vue === "experts" ? "metrics?experts=full" : "metrics", {cache: "no-store", headers: entetes()});
     if (r.status === 401) {
       poserPastille("horsligne", "API key required");
       $("champ-cle").hidden = false;
@@ -249,180 +255,14 @@ function dessinerPastille(m) {
   poserPastille(e, t);
 }
 
-// ------------------------------------------------------------------ Monitor
-const TUILES = [
-  {id: "vitesse", titre: "Speed", icone: "eclair"},
-  {id: "carte0", titre: "GPU 0", icone: "carte"},
-  {id: "carte1", titre: "GPU 1", icone: "carte"},
-  {id: "processeur", titre: "CPU", icone: "processeur"},
-  {id: "ram", titre: "RAM", icone: "memoire"},
-  {id: "disque", titre: "Disk", icone: "disque"},
-];
-const SVG_ETINCELLE = (extra = "") => `<svg class="etincelle" viewBox="0 0 100 34" preserveAspectRatio="none" aria-hidden="true">` +
-  `<path class="aire"/><path class="ligne"/>${extra}</svg>`;
-$("tuiles").innerHTML = TUILES.map((t) => `
-  <div class="carte tuile" id="tuile-${t.id}">
-    <div class="tuile__tete">${ic(t.icone, "ic ic--p")}<span id="tt-${t.id}">${esc(t.titre)}</span></div>
-    <div class="tuile__valeurs">${t.id === "vitesse"
-      ? `<div class="tuile__paire"><span class="tuile__mini">Writing</span><span class="tuile__valeur" id="tv-vitesse">–</span></div>` +
-        `<div class="tuile__paire"><span class="tuile__mini">Reading</span><span class="tuile__valeur tuile__valeur--lecture" id="tv-lecture">–</span></div>`
-      : `<span class="tuile__valeur" id="tv-${t.id}">–</span>`}</div>
-    <div class="tuile__sous" id="ts-${t.id}"></div>
-    ${["vitesse", "carte0", "carte1"].includes(t.id) ? SVG_ETINCELLE(t.id === "vitesse" ? `<g class="lecture"><path class="aire"/><path class="ligne"/></g>` : "")
-      : `<div class="barre" id="tb-${t.id}"><div class="barre__plein"></div></div>`}
-  </div>`).join("");
-
-function etincelle(svg, groupe, valeurs, max) {
-  const g = groupe ? svg.querySelector(groupe) : svg;
-  const ligne = g.querySelector(".ligne"), aire = g.querySelector(".aire");
-  const v = (valeurs || []).map((x) => (Number.isFinite(+x) ? +x : 0));
-  if (v.length < 2) { ligne.setAttribute("d", ""); aire.setAttribute("d", ""); return; }
-  const haut = Math.max(max || 0, ...v, 1);
-  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 32 - (x / haut) * 29]);
-  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
-  ligne.setAttribute("d", d);
-  aire.setAttribute("d", `${d}L100,34L0,34Z`);
-}
-function valeur(id, texte, unite) {
-  $(id).innerHTML = texte == null || texte === "–" ? "–" : `${esc(texte)}${unite ? `<small>${esc(unite)}</small>` : ""}`;
-}
-function barre(id, part, ton) {
-  const b = $(id);
-  b.querySelector(".barre__plein").style.width = `${Math.max(0, Math.min(100, (part || 0) * 100)).toFixed(1)}%`;
-  if (ton) b.dataset.ton = ton; else delete b.dataset.ton;
-}
-// a response's reading speed, only for a message long enough to measure it (at least 256 tokens read)
-function lectureDe(r) {
-  const lus = r.prompt_tokens == null ? 0 : Math.max(0, r.prompt_tokens - (r.reused || 0));
-  return lus >= 256 && r.prompt_ms >= 20 ? lus / (r.prompt_ms / 1000) : null;
-}
-const FINS = {stop: ["badge--fini", "Done"], length: ["badge--arretee", "Max length"], cancelled: ["badge--arretee", "Stopped"],
-              cancel: ["badge--arretee", "Stopped"], disconnect: ["badge--arretee", "Stopped"], error: ["badge--erreur", "Error"],
-              tool_calls: ["badge--fini", "Tool call"]};
+// ------------------------------------------------------------------ Monitor and Experts (web/lapilli-monitor.js)
 const nomProcesseur = (st) => {
   const n = String(st.cpu_name || "");
   if (/^Intel64 Family/i.test(n)) return "Intel";                       // the raw name Windows gives to Python
   if (/^AMD64 Family/i.test(n)) return "AMD";
   return n.replace(/\((R|TM)\)/gi, "").replace(/\s+\d+-Core Processor$/i, "").replace(/\s+CPU\s+@.*$/i, "").replace(/\s+/g, " ").trim();
 };
-
-function dessinerMoniteur(m) {
-  const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
-  const req = m.requests || [], dern = req[0];
-  const e = etatDe(live);
-  // the model's status
-  const libelles = {connexion: "Connecting…", chargement: "Loading the model", lecture: "Reading the message", reflexion: "Thinking",
-                    ecriture: "Writing", repos: "Idle", attente: live.state === "unloaded" ? "Model unloaded" : live.state === "asleep" ? "Asleep" : "Waiting"};
-  $("etat-libelle").textContent = libelles[e] || "Idle";
-  for (const b of document.querySelectorAll("#etat-badges .badge")) b.classList.toggle("allume", b.dataset.b === e || (b.dataset.b === "attente" && live.queued > 0));
-  let detail = [], part = 0, ton = null;
-  if (e === "chargement") {
-    part = ((live.load || {}).percent || 0) / 100; ton = "lecture";
-    detail = [(live.load || {}).percent != null ? `${nf(live.load.percent)}%` : null];
-  } else if (e === "lecture") {
-    const lu = partLue(live); part = lu || 0; ton = "lecture";
-    detail = [`${nf(live.prompt_tokens)} tokens`, lu != null ? `about ${nf(lu * 100)}%` : null,
-              live.prefill_tok_s_mean ? `${nf(live.prefill_tok_s_mean)} tokens/s` : null];
-  } else if (e === "reflexion" || e === "ecriture") {
-    ton = e === "reflexion" ? "reflexion" : null;
-    const max = enCours && reglages.longueur > 0 ? reglages.longueur : 0;
-    part = max ? (live.generated || 0) / max : 0;
-    detail = [`${nf(live.generated)} tokens written`, live.tok_s ? `${nf(live.tok_s, 1)} tokens/s` : null, live.elapsed_s != null ? `${nf(live.elapsed_s, 1)} s` : null];
-  } else if (dern) {
-    detail = [`Last response: ${nf(dern.output_tokens)} tokens${dern.decode_tok_s ? ` at ${nf(dern.decode_tok_s, 1)} tokens/s` : ""}`, ilYa(dern.time * 1000)];
-  } else {
-    detail = ["Waiting for a question"];
-  }
-  $("etat-detail").innerHTML = morceaux(detail) || "&nbsp;";
-  barre("etat-barre", part, ton);
-
-  // speed: now, otherwise the last response's; reading: the last LONG message's (a short one is read in an instant)
-  const longue = req.find((r) => lectureDe(r) != null);
-  const ecr = live.state === "generating" ? live.tok_s : dern ? dern.decode_tok_s : null;
-  const lecVive = (live.state === "reading" || live.state === "generating") && live.prefill_tok_s_mean ? live.prefill_tok_s_mean : null;
-  const lec = lecVive != null ? lecVive : longue ? lectureDe(longue) : null;
-  valeur("tv-vitesse", ecr == null ? null : nf(ecr, 1), "tokens/s");
-  valeur("tv-lecture", lec == null || lec <= 0 ? null : nf(lec), "tokens/s");
-  $("ts-vitesse").innerHTML = morceaux([live.state === "generating" ? "writing: now" : dern ? "writing: last response" : null,
-                                        lecVive != null ? "reading: this message" : longue ? "reading: last long message" : null]);
-  etincelle($("tuile-vitesse").querySelector("svg.etincelle"), null, h.tok_s);
-  etincelle($("tuile-vitesse").querySelector("svg.etincelle"), ".lecture", h.prefill_tok_s_mean);
-  // the two GPU tiles (the first two GPUs reported)
-  const cartesHist = h.gpus || [];
-  for (const k of [0, 1]) {
-    const g = (hw.gpus || [])[k];
-    $(`tuile-carte${k}`).hidden = !g && k === 1;
-    if (!g) { valeur(`tv-carte${k}`, null); $(`ts-carte${k}`).innerHTML = morceaux(["no reading"]); continue; }
-    valeur(`tv-carte${k}`, g.util == null ? null : nf(g.util), "%");
-    $(`ts-carte${k}`).innerHTML = morceaux([g.mem_used != null ? `${go(g.mem_used)} of ${go(g.mem_total, 0)} GB` : null,
-                                             g.temp != null ? `${nf(g.temp)} °C` : null, g.power != null ? `${nf(g.power)} W` : null,
-                                             g.pcie_gen ? `PCIe ${g.pcie_gen_max || g.pcie_gen} x${g.pcie_width}` : null]);
-    const hg = cartesHist.find((x) => x.index === g.index) || cartesHist[k] || {};
-    etincelle($(`tuile-carte${k}`).querySelector("svg.etincelle"), null, hg.util, 100);
-  }
-  // CPU, RAM, disk
-  valeur("tv-processeur", hw.cpu == null ? null : nf(hw.cpu), "%");
-  $("ts-processeur").innerHTML = morceaux([nomProcesseur(st), st.cores ? `${nf(st.cores)} cores` : null, st.threads ? `${nf(st.threads)} threads` : null]);
-  barre("tb-processeur", (hw.cpu || 0) / 100);
-  const ramPart = hw.ram_total ? hw.ram_used / hw.ram_total : 0;
-  valeur("tv-ram", hw.ram_used == null ? null : go(hw.ram_used), hw.ram_total ? `of ${go(hw.ram_total)} GB` : "GB");
-  $("ts-ram").innerHTML = morceaux([hw.ram_total ? `${go(hw.ram_total - hw.ram_used)} GB free` : null]);
-  barre("tb-ram", ramPart, ramPart > 0.92 ? "danger" : null);
-  const dl = hw.disk_read_mb;
-  valeur("tv-disque", dl == null ? null : dl >= 1000 ? nf(dl / 1024, 2) : nf(dl, dl < 10 ? 1 : 0), dl == null ? "" : dl >= 1000 ? "GB/s" : "MB/s");
-  $("ts-disque").innerHTML = morceaux([dl == null ? "no reading" : "read", hw.disk_write_mb != null ? `write ${nf(hw.disk_write_mb, 1)} MB/s` : null]);
-  barre("tb-disque", dl == null ? 0 : Math.min(1, dl / 3000));
-
-  // context, experts and where they run
-  const ctx = eng.max_context || 0;
-  let utilise = 0;
-  if (live.state === "reading" || live.state === "generating") utilise = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (dern) utilise = (dern.prompt_tokens || 0) + (dern.output_tokens || 0);
-  const frac = ctx ? Math.min(1, utilise / ctx) : 0;
-  $("ctx-plein").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-plein").style.opacity = 235.6 * frac >= 3 ? "1" : "0";
-  $("ctx-pct").textContent = `${frac > 0 && frac < 0.01 ? "< 1" : nf(frac * 100)}%`;
-  $("ctx-sous").textContent = ctx ? `${kf(utilise)} of ${kf(ctx)} tokens` : "–";
-  const slots = eng.expert_slots, total = eng.expert_total;
-  $("experts-texte").textContent = slots ? `${nf(slots)}${total ? ` of ${nf(total)}` : ""} · ${go((eng.expert_cache_mib || 0) * 1048576)} GB` : "–";
-  $("experts-plein").style.width = slots && total ? `${Math.min(100, (100 * slots) / total).toFixed(1)}%` : "0%";
-  const touche = dern && Number.isFinite(+dern.hit_rate) ? +dern.hit_rate : null, pair = dern && Number.isFinite(+dern.pcie_share) ? +dern.pcie_share : 0;
-  const parts = touche == null ? [] : [["GPU", "var(--accent)", touche * (1 - pair)], ["Other GPU or PCIe", "color-mix(in srgb, var(--accent-vif) 45%, var(--surface))", pair],
-                                       ["CPU", "var(--encre-douce)", Math.max(0, (1 - touche) * (1 - pair))]];
-  $("repartition").innerHTML = parts.map((p) => `<i style="width:${(p[2] * 100).toFixed(1)}%;background:${p[1]}"></i>`).join("");
-  $("repartition-legende").innerHTML = parts.length ? parts.map((p) => `<span style="--c:${p[1]}">${esc(p[0])} ${nf(p[2] * 100, 1)}%</span>`).join("")
-    : `<span class="doux">After the first response</span>`;
-  const best = m.best || {};
-  const recs = [];
-  if (best.decode) recs.push(`<div class="record">${ic("trophee", "ic ic--p")}<span>Fastest writing <b>${nf(best.decode.tok_s, 1)} tokens/s</b> <span class="doux">(${nf(best.decode.output_tokens)} tokens)</span></span></div>`);
-  if (best.prefill) recs.push(`<div class="record">${ic("trophee", "ic ic--p")}<span>Fastest reading <b>${nf(best.prefill.tok_s)} tokens/s</b> <span class="doux">(${nf(best.prefill.read_tokens)} tokens)</span></span></div>`);
-  $("records").innerHTML = recs.join("") || `<div class="record doux">${ic("trophee", "ic ic--p")}<span>Records appear after a few responses.</span></div>`;
-
-  // recent responses
-  const corps = $("requetes-corps");
-  if (!req.length) {
-    corps.innerHTML = `<tr><td colspan="8" class="doux">No responses yet</td></tr>`;
-  } else {
-    corps.innerHTML = req.slice(0, 12).map((r) => {
-      const [cls, texte] = FINS[r.finish] || ["", r.finish || "–"];
-      const lect = lectureDe(r);
-      return `<tr><td>${esc(quand(r.time * 1000, true))}</td><td><span class="badge ${cls}">${esc(texte)}</span></td>` +
-        `<td class="num">${nf(r.prompt_tokens)}</td><td class="num">${nf(r.reused)}</td><td class="num">${nf(r.output_tokens)}</td>` +
-        `<td class="num">${lect == null ? "–" : nf(lect)}</td><td class="num">${nf(r.decode_tok_s, 1)}</td><td class="num">${nf(r.duration_s, 1)} s</td></tr>`;
-    }).join("");
-  }
-  const t = m.totals || {};
-  $("requetes-nombre").textContent = t.requests ? `${nf(t.requests)} since ${quand(t.since * 1000)}` : "";
-  if (t.requests) {
-    const lus = (t.prompt || 0) - (t.reused || 0);
-    $("totaux").innerHTML = morceaux([`Since ${quand(t.since * 1000)}: ${nf(t.requests)} response${t.requests > 1 ? "s" : ""}`,
-      `${nf(lus)} tokens read${t.prompt_ms > 0 && lus > 0 ? ` at ${nf(lus / (t.prompt_ms / 1000))} tokens/s` : ""}`,
-      t.reused ? `${nf(t.reused)} reused` : null,
-      `${nf(t.written)} written${t.decode_ms > 0 && t.written > 0 ? ` at ${nf(t.written / (t.decode_ms / 1000), 1)} tokens/s` : ""}`]);
-  } else {
-    $("totaux").textContent = "";
-  }
-}
+Moniteur.init();
 
 function faits(el, lignes) {
   el.innerHTML = lignes.filter((l) => l[1] != null && l[1] !== "").map(([k, v, copie]) => `<dt>${esc(k)}</dt><dd>${copie
@@ -431,6 +271,12 @@ function faits(el, lignes) {
 }
 function dessinerApropos(m) {
   const eng = m.engine || {}, hw = m.hardware || {}, st = m.hardware_static || {};
+  // the experts both cards hold, from the tiers the engine publishes (GPU 0's places, GPU 1's experts: 7,311 + 10,501
+  // for the Flash-Next); GPU 0's places alone only from an engine that does not publish them
+  const ti = m.experts && m.experts.tiers;
+  const surCartes = ti ? (ti.main.experts || 0) + (ti.peer.experts || 0) : eng.expert_slots;
+  const octetsCartes = ti ? (ti.main.bytes || 0) + (ti.peer.bytes || 0) : (eng.expert_cache_mib || 0) * 1048576;
+  const tousExperts = m.experts && m.experts.layers ? m.experts.layers * m.experts.per_layer : eng.expert_total;
   const kv = {int8: "8-bit", q4_0: "4-bit", fp16: "16-bit", f16: "16-bit", bf16: "16-bit"}[eng.kv] || eng.kv;
   faits($("faits-moteur"), [
     ["Model", `${eng.model || sante.model}${eng.quant ? ` · ${eng.quant}` : ""}`],
@@ -438,7 +284,7 @@ function dessinerApropos(m) {
     ["Context", eng.max_context ? `${nf(eng.max_context)} tokens` : null],
     ["Images", sante.images ? "supported (vision on)" : "no (vision off)"],
     ["Context memory", kv ? `${kv}, ${eng.kv_resident ? `${nf(eng.kv_resident)} positions per layer on the GPUs, the rest in RAM` : "all on the GPUs"}` : null],
-    ["Experts on the GPUs", eng.expert_slots ? `${nf(eng.expert_slots)}${eng.expert_total ? ` of ${nf(eng.expert_total)}` : ""} (${go((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
+    ["Experts on the GPUs", surCartes ? `${nf(surCartes)}${tousExperts ? ` of ${nf(tousExperts)}` : ""} (${go(octetsCartes)} GB)` : null],
     ["MTP drafts", eng.spec ? "enabled" : null],
   ]);
   const cartes = (st.gpus || []).map((g) => g.name).filter(Boolean);
@@ -464,7 +310,12 @@ document.addEventListener("click", (e) => {
 
 function dessinerMesures(m) {
   dessinerPastille(m);
-  if (vue === "moniteur") dessinerMoniteur(m);
+  // the Experts tab: only for a model whose server says where its experts are (a mixture of experts)
+  const experts = Moniteur.aDesExperts(m);
+  $("onglet-experts").hidden = !experts;
+  if (!experts && vue === "experts") { montrerVue("moniteur"); return; }
+  if (vue === "moniteur") Moniteur.dessiner(m);
+  if (vue === "experts") Moniteur.dessinerExperts(m);
   if (vue === "apropos") dessinerApropos(m);
   if (enCours) activite();
 }

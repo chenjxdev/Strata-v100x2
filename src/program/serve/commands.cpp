@@ -35,11 +35,37 @@ std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t 
 
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
+// (Lapilli: as upstream Basalt's, commit ff0b978d, without its INFO cards= facts)
+void Runtime::stats_tick(bool force, bool with_map) {
+    const ConsoleStats::Clock::time_point now = ConsoleStats::Clock::now();
+    if (!stats.due(now, force)) return;
+    std::string out = stats.slot_lines();
+    // (Lapilli) the map at its own pace, or when asked (a request's end, the server's STATS); never on a request's start:
+    // its slot line is what changed, and the map would delay its first token
+    if (with_map || (!force && std::chrono::duration<double>(now - map_last_).count() >= map_every_)) {
+        int64_t total = 0;
+        std::vector<uint8_t> homes;
+        std::vector<uint32_t> routed;
+        if (expert_map(total, homes, routed)) {
+            out += ConsoleStats::map_line(total, homes, routed);
+            map_last_ = now;
+            map_every_ = homes.size() > kMapEveryCells ? 2 * ConsoleStats::kEverySeconds : ConsoleStats::kEverySeconds;
+        }
+    }
+    if (out.empty()) return;
+    std::fputs(out.c_str(), stdout);
+    std::fflush(stdout);
+}
+
 Flow Runtime::dispatch() {
     if (batch_on() || windows_in_flight()) {
         if (!try_next_line(line)) {
             const BusyClock busy(busy_s, busy_on, busy_from);
+            const size_t active = (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
             if (!next_batch_window()) return Flow::error;
+            // a slot that ended its request has its last figures out with its BDONE (the map's too)
+            const bool ended = active != (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
+            stats_tick(ended, ended);
             return Flow::next;
         }
         if (line.rfind("BSTOP ", 0) != 0 && !drain_windows()) return Flow::error;
@@ -74,6 +100,11 @@ Flow Runtime::dispatch() {
         return Flow::next;
     }
     if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
+    if (line == "STATS") {   // the server's console: XSLOT and XMAP lines from now on (console_stats.hpp)
+        stats.on = true;
+        stats_tick(true, true);
+        return Flow::next;
+    }
     if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
         enc_command(line);
         return Flow::next;

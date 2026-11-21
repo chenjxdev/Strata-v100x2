@@ -36,6 +36,7 @@
 #include "basalt/core/weights.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/core/expert_map.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
@@ -168,6 +169,9 @@ public:
     bool slot0_solo() const override { return slot0_is_solo; }
     bool pipelined() const override { return piped; }
     int64_t slot_context(int slot) const override { return slot_cap[(size_t) slot]; }
+    // the server's console figures (STATS; Lapilli): the decode's expert counts (DONE's) and the expert map
+    LookupCounts lookup_counts() override;
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
 
 private:
     friend class QfnRequest;
@@ -177,6 +181,18 @@ private:
     using Context::n_vocab;
     using Context::grammar_vocab;
     friend class Request;
+    // ---- the server's expert map (STATS; Lapilli).  The tally counts every decode lookup (ExpertDispatch::map); a home is
+    // where the expert is computed now: `host_res` (a slot of the stage that owns the layer: GPU 0, or another card in a
+    // layer split), then the peers, then RAM (`srcp`), else the file.  The ExpertCache tables are filled at start only:
+    // never read them for "now".  `map_writer_live`: apply_thr may be landing a window's residency swaps (QfnRequest sets
+    // it), so expert_map keeps the homes it read last rather than read host_res beside the writer.
+    basalt::core::ExpertMapTally map_tally_{};
+    std::vector<uint8_t> map_homes_{};
+    std::string map_tiers_sent_{};
+    bool map_writer_live = false;
+    static constexpr int64_t kMapAll = 32767;   // core::ExpertMapTally's int16 index: the whole map up to that size
+    uint8_t map_home(int64_t layer, int64_t expert) const;
+    void map_tiers_info();
     basalt::prefill::Prefill sp{};
     void* borrow{};
     uint64_t borrow_bytes{};

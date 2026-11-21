@@ -333,12 +333,13 @@ def make_handler(target: Service | Router):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    query = parse_qs(urlsplit(self.path).query)
+                    name = query.get("model", [None])[0]
                     shown = router.shown() if name is None else router.service_for(name)
                     if shown is None:
                         self._json(404, {"error": {"message": "model not found"}})
-                    else:
-                        self._json(200, router.metrics(shown))
+                    else:   # ?experts=full: the expert map's arrays too (the page's Experts tab)
+                        self._json(200, router.metrics(shown, full_map=query.get("experts", [""])[0] == "full"))
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
