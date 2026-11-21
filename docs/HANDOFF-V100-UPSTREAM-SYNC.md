@@ -188,7 +188,44 @@ temperature 0，`max_tokens 256`。
 
 decode 侧本轮实测也是上游 ≈ fork（见 §3）。
 
-## 7. 还没试的候选
+## 7. V100 上还没试过的候选：逐个试过了
+
+| 候选 | 结果 | 机制 |
+| --- | --- | --- |
+| `STRATA_MTP_STAGE0=1` | **负** | 草稿层挪到首卡后首卡多占 220 MiB，专家缓存从 4594 掉到 4176 槽（-9%），命中率下降 |
+| `vm.nr_hugepages=28689`（大页） | **别做** | 见下节：把机器搞挂 |
+| `--vram-elastic` | 不是提速旋钮 | upstream 的定义是「专家缓存分段，让 `POST /v1/vram` 能在请求之间把显存还给别的程序」——是显存共享功能；它会顺带让 `STRATA_KV_GROW` 生效 |
+
+### 7.1 `STRATA_MTP_STAGE0=1` 实测（同配置，唯一变量）
+
+| 指标 | base | STAGE0=1 | 差 |
+| --- | --- | --- | --- |
+| prefill 17~18K 中位 | 1677.2 tok/s | 1647.8 | -1.8% |
+| prefill 均值 | 1671.4 | 1646.2 | -1.5% |
+| decode 中位 | 94.50 | 89.90 | -4.9% |
+| decode 均值 | 93.02 | 90.56 | -2.6% |
+| decode warm 中位 | 96.45 | 92.15 | -4.5% |
+
+引擎日志说明了原因：`STRATA_MTP_STAGE0=1` 让草稿层落到首卡（`+220 MiB for the draft head`），
+首卡的专家缓存从 4594 槽降到 4176 槽（-9%），命中率下降 → decode 变慢。
+（`long` prompt 上 STAGE0 反而快 7.7%，两个方向都有，属噪声带内，但整体和机制一致为负。）**保持关闭。**
+
+### 7.2 教训：不要在这台机器上预留大页（2026-11-21 12:30 事故）
+
+试 `vm.nr_hugepages=28689`（= 56 GiB）想给专家 arena 用 MAP_HUGETLB，结果：
+
+- 引擎直接拒绝：`MAP_HUGETLB unavailable (needed 28689 2 MiB pages, vm.nr_hugepages=28689);
+  transparent huge pages NOT requested: only 0 GiB of free 2 MiB blocks for a 56 GiB arena,
+  compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway) (#2126)`
+- 预留之后内核进入内存规整/回收：journald 连续 `Under memory pressure, flushing caches`，
+  `workqueue: fill_page_cache_func hogged CPU`（12:31 起）
+- 12:37:14 `systemd-networkd: oray_vnc: Link DOWN` —— 蒲公英 VPN 掉线，机器随之失联
+- **没有 OOM-kill 事件**（不是被 OOM 杀的，是内存压力 + VPN 断链），12:47 机器重启
+
+结论：引擎自己都写了「compaction would stall the load」。这台机器在这个负载下给不出 56 GiB 连续大页，
+再试只会重复把机器搞挂。**大页这条路在 V100 上放弃**（THP 的 madvise 模式已经在用，是默认路径）。
+
+## 8. 还没试的候选
 
 0. ~~**`STRATA_PF_FUSED=1`**~~：已测，**V100 上无效**（CC 7.0 被门槛挡掉，见 §6）。
 1. ~~同 prompt 的上游 vs fork prefill 对比~~：**已测，1682.4 vs 1677.2 tok/s，MMQ 无收益**（见 §6）。
