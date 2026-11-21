@@ -523,13 +523,110 @@ void bench_q80(cudaStream_t s) {
     cudaEventDestroy(e1);
 }
 
+// --bench-v70 (Lapilli, V100): the Q5_K multi-column calls at DeepSeek-V4.1-Flash's shapes, the exact layout (the
+// default) against the V100 layout at 1, 2 and 4 rows a warp (native_mmvq_set_multi_v70), and one column for scale;
+// each V100 result against the exact one (largest difference over the largest output). Weights cycled past L2.
+struct V70Geom { const char* what; int type, block_elems, block_bytes, scale_at[2], n_in, n_out; };
+const V70Geom V70_GEOMS[] = {
+    {"attn_q_b", 13, 256, 176, {0, 2}, 1280, 32768}, {"attn_output_b", 13, 256, 176, {0, 2}, 8192, 5120},
+    {"ffn_down_shexp", 13, 256, 176, {0, 2}, 2304, 5120}, {"ffn_gate/up_shexp", 13, 256, 176, {0, 2}, 5120, 2304},
+    {"output (head)", 13, 256, 176, {0, 2}, 5120, 129280},
+    {"Q8_0 attn_q_a", 8, 32, 34, {0, -1}, 5120, 1280}, {"Q8_0 attn_kv", 8, 32, 34, {0, -1}, 5120, 512},
+    {"Q8_0 drafter fc x3", 8, 32, 34, {0, -1}, 15360, 5120}, {"Q8_0 drafter fc x4", 8, 32, 34, {0, -1}, 20480, 5120},
+    {"Q8_0 drafter q_b", 8, 32, 34, {0, -1}, 1280, 32768}, {"Q8_0 drafter shexp", 8, 32, 34, {0, -1}, 5120, 2304},
+};
+
+void bench_v70(cudaStream_t s) {
+    namespace k = basalt::kernels;
+    std::printf("\n=== --bench-v70: Q5_K and Q8_0, us per call (weights cycled past L2); exact / V100 R=1 / R=2 / R=4, "
+                "and the V100 results' largest difference relative to the exact ones ===\n");
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    std::mt19937 rng(70u);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const V70Geom& g : V70_GEOMS) {
+        const std::size_t wbytes = k::native_mmvq_weight_bytes(g.type, g.n_in, g.n_out);
+        const std::size_t stride = (wbytes + 255) / 256 * 256;
+        const int copies = std::max<int>(2, (int) ((256u << 20) / stride));
+        std::vector<uint8_t> w(wbytes);
+        for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+        for (std::size_t blk = 0; blk < wbytes / (std::size_t) g.block_bytes; ++blk)
+            for (int at : g.scale_at)
+                if (at >= 0) {
+                    const uint16_t h = sane_half(rng);
+                    std::memcpy(&w[blk * (std::size_t) g.block_bytes + (std::size_t) at], &h, 2);
+                }
+        uint8_t* dw = nullptr;
+        uint8_t* dq = nullptr;
+        float *dx = nullptr, *dref = nullptr, *dy = nullptr;
+        const int TMAX = 6;
+        if (!ck(cudaMalloc(&dw, stride * copies), "malloc") || !ck(cudaMalloc(&dq, k::native_q8_1_bytes(g.n_in, TMAX)), "malloc") ||
+            !ck(cudaMalloc(&dx, (std::size_t) g.n_in * TMAX * 4), "malloc") ||
+            !ck(cudaMalloc(&dref, (std::size_t) g.n_out * TMAX * 4), "malloc") || !ck(cudaMalloc(&dy, (std::size_t) g.n_out * TMAX * 4), "malloc"))
+            return;
+        for (int r = 0; r < copies; ++r) cudaMemcpy(dw + stride * r, w.data(), wbytes, cudaMemcpyHostToDevice);
+        std::vector<float> x((std::size_t) g.n_in * TMAX);
+        for (auto& v : x) v = nd(rng);
+        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        k::quantize_q8_1_rows(dx, TMAX, g.n_in, dq, s);
+        const auto time_us = [&](int T) {
+            for (int r = 0; r < copies; ++r) k::native_mmvq(g.type, dw + stride * r, dq, dy, g.n_in, g.n_out, T, s);
+            const int N = std::max(copies * 4, 40);
+            cudaEventRecord(e0, s);
+            for (int r = 0; r < N; ++r) k::native_mmvq(g.type, dw + stride * (r % copies), dq, dy, g.n_in, g.n_out, T, s);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            return 1000.0 * ms / N;
+        };
+        k::native_mmvq_set_multi_v70(0);
+        const double one = time_us(1);
+        std::printf("%-18s %5d -> %6d (%.1f MB): one column %7.1f us (%4.0f GB/s)\n", g.what, g.n_in, g.n_out, wbytes / 1e6, one,
+                    wbytes / one / 1e3);
+        for (int T : {3, 6}) {
+            k::native_mmvq_set_multi_v70(0);
+            k::native_mmvq(g.type, dw, dq, dref, g.n_in, g.n_out, T, s);
+            std::vector<float> ref((std::size_t) g.n_out * T), got((std::size_t) g.n_out * T);
+            cudaMemcpy(ref.data(), dref, ref.size() * 4, cudaMemcpyDeviceToHost);
+            double big = 0;
+            for (float v : ref) big = std::max(big, (double) std::fabs(v));
+            const double exact = time_us(T);
+            std::printf("  T=%d  exact %7.1f us", T, exact);
+            for (int R : {1, 2, 4}) {
+                k::native_mmvq_set_multi_v70(R);
+                k::native_mmvq(g.type, dw, dq, dy, g.n_in, g.n_out, T, s);
+                cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost);
+                double d = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) d = std::max(d, (double) std::fabs(got[i] - ref[i]));
+                std::printf(" | R=%d %7.1f us (%.1e)", R, time_us(T), big > 0 ? d / big : d);
+            }
+            std::printf("\n");
+        }
+        k::native_mmvq_set_multi_v70(0);
+        cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(dref); cudaFree(dy);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     bool do_bench = false;
     for (int i = 1; i < argc; ++i) do_bench |= std::string(argv[i]) == "--bench";
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--bench-v70") {   // the V100 layout's bench alone (no checks)
+            cudaStream_t s0;
+            if (!ck(cudaStreamCreate(&s0), "stream create")) return 1;
+            bench_v70(s0);
+            return 0;
+        }
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
+    // the exact contract is the exact layout's: the V100 Q5_K layout (on by default on compute capability 7.x) is off here
+    basalt::kernels::native_mmvq_set_multi_v70(0);
 
     Totals on, off;
     const int bad = sweep(true, s, on);

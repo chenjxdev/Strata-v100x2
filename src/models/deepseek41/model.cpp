@@ -15,11 +15,21 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
+    if (engram_ && engram_->is_open()) {   // the Engram reads of this run (Lapilli, V100), as qwen4exp's io_report
+        const ngram::ReaderStats s = engram_->snapshot();
+        basalt::log::info("basalt deepseek41",
+                          "Engram io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
+                          "blocked %.3f ms total (submit %.3f ms), kept awake by %llu reads (slowest %.1f ms)",
+                          (unsigned long long) s.requests, s.requests ? 100.0 * (double) s.cache_hits / (double) s.requests : 0.0,
+                          (unsigned long long) s.reads, (double) s.bytes / 1e6, s.percentile(0.5), s.percentile(0.99),
+                          s.wait_us / 1000.0, s.submit_us / 1000.0, (unsigned long long) s.keepalive_reads, s.keepalive_us_max / 1000.0);
+    }
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
@@ -113,6 +123,14 @@ bool DsModel::load(const std::string& path, std::string& err) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
         if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        // BASALT_DS_KEEPALIVE_MS (read once; Lapilli, V100): keep the SSD awake by reading one page of the table after this
+        // many ms without a read, until 60 s after the last request (as qwen4exp does at 40 ms); unset or 0: off
+        const char* ka = std::getenv("BASALT_DS_KEEPALIVE_MS");
+        const double ka_ms = (ka != nullptr && *ka != 0) ? std::atof(ka) : 0.0;
+        if (ka_ms > 0) {
+            engram_->set_keepalive(ka_ms, 60.0);
+            basalt::log::info("basalt deepseek41", "Engram SSD kept awake: a read after %.0f ms without one, until 60 s after the last request", ka_ms);
+        }
     }
     return true;
 }

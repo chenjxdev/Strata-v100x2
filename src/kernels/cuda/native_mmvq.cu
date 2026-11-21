@@ -1148,7 +1148,13 @@ struct SmallTraits {
 // ncols = 1 layout and keeps every column bitwise equal to a single-column call. The UPSTREAM layout is
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
-bool g_multi_exact = true;   // the upstream layout is not the default
+// BASALT_MULTI_EXACT (read once at start, Lapilli, V100): 0 takes the upstream layout for ncols > 1; unset or any
+// other value keeps the exact layout. Tests still set it with native_mmvq_set_multi_exact.
+static bool multi_exact_from_env() {
+    const char* e = std::getenv("BASALT_MULTI_EXACT");
+    return !(e != nullptr && e[0] == '0' && e[1] == 0);
+}
+bool g_multi_exact = multi_exact_from_env();   // the upstream layout is not the default
 
 template<typename F, int NCOLS, int NW, int ROWS>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
@@ -1195,6 +1201,177 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
             if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
         }
     }
+}
+
+// ---------------------------------------------------------------- V100 (Lapilli): Q5_K columns, R rows a warp
+// BASALT_MULTI_V70=R (read once; 1, 2 or 4 rows a warp, 0 off; unset: on for compute capability 7.x, 4 rows a warp from
+// 5 columns and 2 below, the fastest measured on V100; native_mmvq_set_multi_v70 sets it for tests):
+// Q5_K calls with ncols > 1 take native_q5_k_multi_v70_kernel. On V100 the layouts above are bound by the activation
+// reads, not by the weights: each thread reads its slot's q8_1 words again for every row and every column (36 words for
+// 8 weight words at 6 columns). Here a warp takes R rows and walks their slots once: a slot's words for the NCOLS
+// columns (two q8_1 blocks each: 4 words and 2 scales, the ones Q5KTraits::apply reads) go into registers once and serve
+// the R rows. Same products and scales as Q5KTraits; the sums are grouped by lane (32 per row and column) then warp_sum,
+// so not bitwise a single-column call's: float rounding only.
+int g_multi_v70 = [] {   // -1: the device decides (on for compute capability 7.x)
+    const char* e = std::getenv("BASALT_MULTI_V70");
+    if (e == nullptr || *e == 0) return -1;
+    const int r = std::atoi(e);
+    return (r == 1 || r == 2 || r == 4) ? r : 0;
+}();
+
+// The rows a warp for an NCOLS-column call on the current device, or 0 for the other layouts.
+template<int NCOLS>
+int multi_v70_rows() {
+    if (g_multi_v70 >= 0) return g_multi_v70;
+    static int major[64] = {};   // per device, 0 = not read yet, -1 = unreadable
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    if (major[dev] == 0 && cudaDeviceGetAttribute(&major[dev], cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        major[dev] = -1;
+    }
+    return major[dev] == 7 ? (NCOLS >= 5 ? 4 : 2) : 0;
+}
+constexpr int kV70Warps = 4;   // warps a block
+
+template<int NCOLS, int R>
+__launch_bounds__(kV70Warps * WARP)
+__global__ void native_q5_k_multi_v70_kernel(const Q5KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                             float* __restrict__ y, int n_in, int n_out) {
+    constexpr int SPB = QI / VDR;                      // slots a block: Q5KTraits::T
+    const int lane = int(threadIdx.x);
+    const int row0 = (int(blockIdx.x) * kV70Warps + int(threadIdx.y)) * R;
+    pdl_wait();
+    if (row0 >= n_out) return;
+    const int bpr = n_in / QK;                         // Q5_K blocks a row
+    const int x_stride = n_in / Q8K;                   // q8_1 blocks a column
+    const int slots = bpr * SPB;
+    float acc[R][NCOLS] = {};
+    for (int s = lane; s < slots; s += WARP) {
+        const int kbx = s / SPB;
+        const int iqs = VDR * (s % SPB);               // Q5KTraits::kqs
+        const int bq8_offset = 2 * ((iqs / 2) / 4);    // Q5KTraits::load's
+        // q5_q8_dot_impl split by what each part reads: the activations' words, scales and byte sums (its dot2, the
+        // min term's) once a slot for every column; the weights' 5-bit values and scale bytes once a row; the dp4a
+        // products and the sums per row and column
+        int u[NCOLS][4];
+        float d8[NCOLS][2], d8s[NCOLS][2];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {              // Q5KTraits::apply's reads
+                const Q81Block* b = x + std::size_t(j) * x_stride + kbx * (QK / Q8K) + bq8_offset + i;
+                d8[j][i] = __low2float(b->ds);
+                const int* q8 = reinterpret_cast<const int*>(b->qs) + ((iqs / 2) % 4);
+                u[j][2 * i] = q8[0];
+                u[j][2 * i + 1] = q8[4];
+                d8s[j][i] = d8[j][i] * (float) DP4A(0x01010101, u[j][2 * i], DP4A(0x01010101, u[j][2 * i + 1], 0));
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(row0 + r, n_out - 1);  // a short last warp reads a valid row and stores nothing
+            const Q5KTraits::W wv = Q5KTraits::load(w + std::size_t(row) * bpr + kbx, iqs);
+            const uint32_t scm = pack_scale_min(wv.aux);
+            int v[2][2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                v[i][0] = ((wv.vl[0] >> (4 * i)) & 0x0f0f0f0f) | (((wv.vh[0] >> i) << 4) & 0x10101010);
+                v[i][1] = ((wv.vl[1] >> (4 * i)) & 0x0f0f0f0f) | (((wv.vh[1] >> i) << 4) & 0x10101010);
+            }
+            const int sc0 = (int) packed_byte(scm, 0), sc1 = (int) packed_byte(scm, 1);
+            const float m0 = (float) packed_byte(scm, 2), m1 = (float) packed_byte(scm, 3);
+            const float2 dm = __half22float2(wv.dm);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const int dot0 = DP4A(v[0][0], u[j][0], DP4A(v[0][1], u[j][1], 0));
+                const int dot1 = DP4A(v[1][0], u[j][2], DP4A(v[1][1], u[j][3], 0));
+                const float sd = d8[j][0] * (float) (dot0 * sc0) + d8[j][1] * (float) (dot1 * sc1);
+                const float sm = d8s[j][0] * m0 + d8s[j][1] * m1;
+                acc[r][j] += dm.x * sd - dm.y * sm;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float v = warp_sum(acc[r][j]);
+            if (lane == 0 && row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+// The same V100 layout for Q8_0 (SmallTraits<Q80Block, 8>): 4 slots a 32-value block, each 2 weight words and the
+// block's scale; a slot's 2 activation words and scale for every column read once for the R rows. Products and scales
+// as small_q8_dot (d0 * d1 * sumi), sums grouped by lane then warp_sum: float rounding only.
+template<int NCOLS, int R>
+__launch_bounds__(kV70Warps * WARP)
+__global__ void native_q80_multi_v70_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, int n_in, int n_out) {
+    constexpr int SPB = 4;                             // SmallTraits<Q80Block, 8>::T
+    const int lane = int(threadIdx.x);
+    const int row0 = (int(blockIdx.x) * kV70Warps + int(threadIdx.y)) * R;
+    pdl_wait();
+    if (row0 >= n_out) return;
+    const int bpr = n_in / 32;                         // Q8_0 blocks a row (and q8_1 blocks a column)
+    const int slots = bpr * SPB;
+    float acc[R][NCOLS] = {};
+    for (int s = lane; s < slots; s += WARP) {
+        const int kbx = s / SPB;
+        const int iqs = 2 * (s % SPB);                 // SmallTraits::kqs
+        int u[NCOLS][2];
+        float d1[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const Q81Block* b = x + std::size_t(j) * bpr + kbx;
+            u[j][0] = reinterpret_cast<const int*>(b->qs)[iqs];
+            u[j][1] = reinterpret_cast<const int*>(b->qs)[iqs + 1];
+            d1[j] = __low2float(b->ds);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(row0 + r, n_out - 1);  // a short last warp reads a valid row and stores nothing
+            const Q80Block* wb = w + std::size_t(row) * bpr + kbx;
+            const int v0 = load_int_b2(wb->qs, iqs), v1 = load_int_b2(wb->qs, iqs + 1);
+            const float d0 = wb->d;
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) acc[r][j] += d0 * d1[j] * float(DP4A(v1, u[j][1], DP4A(v0, u[j][0], 0)));
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float v = warp_sum(acc[r][j]);
+            if (lane == 0 && row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+template<int NCOLS>
+void launch_q80_multi_v70(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int rows, cudaStream_t s) {
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const dim3 threads(WARP, kV70Warps);
+    const auto blocks = [&](int r) { return dim3(unsigned((n_out + kV70Warps * r - 1) / (kV70Warps * r))); };
+    if (rows == 4) launch_pdl(native_q80_multi_v70_kernel<NCOLS, 4>, blocks(4), threads, 0, s, w, x, y, n_in, n_out);
+    else if (rows == 2) launch_pdl(native_q80_multi_v70_kernel<NCOLS, 2>, blocks(2), threads, 0, s, w, x, y, n_in, n_out);
+    else launch_pdl(native_q80_multi_v70_kernel<NCOLS, 1>, blocks(1), threads, 0, s, w, x, y, n_in, n_out);
+}
+
+template<int NCOLS>
+void launch_q5_k_multi_v70(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int rows, cudaStream_t s) {
+    const auto* w = static_cast<const Q5KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const dim3 threads(WARP, kV70Warps);
+    const auto blocks = [&](int r) { return dim3(unsigned((n_out + kV70Warps * r - 1) / (kV70Warps * r))); };
+    if (rows == 4) launch_pdl(native_q5_k_multi_v70_kernel<NCOLS, 4>, blocks(4), threads, 0, s, w, x, y, n_in, n_out);
+    else if (rows == 2) launch_pdl(native_q5_k_multi_v70_kernel<NCOLS, 2>, blocks(2), threads, 0, s, w, x, y, n_in, n_out);
+    else launch_pdl(native_q5_k_multi_v70_kernel<NCOLS, 1>, blocks(1), threads, 0, s, w, x, y, n_in, n_out);
 }
 
 // ---------------------------------------------------------------- Q6_K columns on short rows (exact layout)
@@ -1326,6 +1503,24 @@ template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if constexpr (std::is_same_v<F, Q5KTraits>) {
+        if (const int rows = multi_v70_rows<NCOLS>()) {   // BASALT_MULTI_V70: the V100 layout (float rounding only)
+            launch_q5_k_multi_v70<NCOLS>(weights, x_q8_1, y, n_in, n_out, rows, s);
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        // the same switch for Q8_0, on the shapes where the V100 bench found it faster: 5 columns or more and long rows or
+        // many of them (at 3 columns, or on a few short rows, the exact layout's four warps a row win), 4 rows a warp
+        static const bool q80_on = [] {   // BASALT_Q80_V70=1 (read once): off by default, no gain measured in decode
+            const char* e = std::getenv("BASALT_Q80_V70");
+            return e != nullptr && e[0] == '1' && e[1] == 0;
+        }();
+        if (q80_on && NCOLS >= 5 && (n_in >= 8192 || n_out >= 16384) && multi_v70_rows<NCOLS>() != 0) {
+            launch_q80_multi_v70<NCOLS>(weights, x_q8_1, y, n_in, n_out, g_multi_v70 > 0 ? g_multi_v70 : 4, s);
+            return;
+        }
+    }
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
@@ -1706,6 +1901,7 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 } // namespace
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
+void native_mmvq_set_multi_v70(int rows) { g_multi_v70 = rows == -1 ? -1 : (rows == 1 || rows == 2 || rows == 4) ? rows : 0; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count

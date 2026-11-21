@@ -3034,6 +3034,38 @@ int exp_lb_level() {
     return v;
 }
 
+// BASALT_GU2_MINB=1, 2, 3 or 4 (read once; Lapilli, V100): native_gu2_kernel on 5120-value rows at that many blocks
+// an SM at least. Unset (or anything else): 2 on compute capability 7.x, where the 128 registers a thread then has keep
+// more loads in flight (V100, DeepSeek-V4.1-Flash: +8 to +10 % in decode), kGu2MinBlocks' 3 elsewhere. The same
+// arithmetic in the same order: only the register allocation changes.
+int gu2_minb() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_GU2_MINB");
+        const int n = (e != nullptr && *e != 0) ? std::atoi(e) : 0;
+        if (n >= 1 && n <= 4) {
+            v = n;
+        } else {
+            int dev = 0, major = 0;
+            const bool ok = cudaGetDevice(&dev) == cudaSuccess &&
+                            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+            if (!ok) (void) cudaGetLastError();
+            v = ok && major == 7 ? 2 : 3;
+        }
+    }
+    return v;
+}
+
+// BASALT_GU2_NC=6 (read once; with BASALT_GU2_MINB 1 or 2): those launches take up to 6 entries a pass instead of 3
+int gu2_nc() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_GU2_NC");
+        v = (e != nullptr && e[0] == '6' && e[1] == 0) ? 6 : 3;
+    }
+    return v;
+}
+
 // BASALT_GU_U5=1 (3 blocks per SM) or 2 (2 blocks): the gate/up kernel with U5, read once; 0: as upstream
 int gu_u5() {
     static int v = -1;
@@ -3077,6 +3109,11 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
         if (allow_mma && g_gu2 && !g_old_kernels && (gu2_usable(L) || gu2_usable(L, 160))) {
             const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
             if (gu2_usable(L)) native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (gu2_minb() == 4) native_gu2_kernel<TG, TG, 160, 4><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (gu2_minb() == 2 && gu2_nc() == 6) native_gu2_kernel<TG, TG, 160, 2, 6><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (gu2_minb() == 2) native_gu2_kernel<TG, TG, 160, 2><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (gu2_minb() == 1 && gu2_nc() == 6) native_gu2_kernel<TG, TG, 160, 1, 6><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (gu2_minb() == 1) native_gu2_kernel<TG, TG, 160, 1><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             else native_gu2_kernel<TG, TG, 160><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }

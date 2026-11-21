@@ -33,6 +33,12 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 
+// BASALT_MULTI_V70=R (read at startup; R = 1, 2 or 4 rows a warp, 0 off; unset: on for compute capability 7.x, 4 rows
+// a warp from 5 columns and 2 below; the setter overrides it, for tests, -1 giving the choice back to the device):
+// ncols > 1 Q5_K calls take the V100 layout, which reads each slot's activations once for R rows. Equal to ncols == 1
+// to float rounding only, so with it on the multi_exact contract does not hold for Q5_K. Set before graph capture.
+void native_mmvq_set_multi_v70(int rows);
+
 // MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): ncols > 1 IQ4_XS calls in exact mode
 // run on int8 tensor cores where the device has them (int8 MMA), every column still bitwise equal to a
 // single-column call. Set before graph capture; captured graphs keep the kernels they captured.

@@ -259,14 +259,26 @@ bool ExpertTier::open_share(std::string& err) {
     // a row of a layer's products is three matrices of n_embd x n_ff multiply-adds
     const core::DeviceRates r0 = core::device_rates(main_dev), r1 = core::device_rates(peer_->device());
     const double macs = 3.0 * (double) g.n_embd * (double) g.n_ff_exp;
+    // (Lapilli, V100) switches, read once (defaults: the values above): BASALT_DS_MMQ_MACS the multiply-adds an SM
+    // retires per cycle in the MMQ expert products (kMmqMacsPerSmCycle, measured on Blackwell); BASALT_DS_LINK1 a factor on
+    // the second card's link (0: it takes no RAM expert)
+    const auto env_num = [](const char* name, double dflt) {
+        const char* e = std::getenv(name);
+        return (e != nullptr && *e != 0) ? std::atof(e) : dflt;
+    };
+    const double mmq_macs = env_num("BASALT_DS_MMQ_MACS", prefill::kMmqMacsPerSmCycle);
+    const double link1_scale = env_num("BASALT_DS_LINK1", 1.0);
     rates_.assign((size_t) n_layers_, {});
     for (prefill::ShareRates& r : rates_) {
         r.link0 = r0.link_bytes;
-        r.link1 = r1.link_bytes;
-        r.rows0 = r0.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
-        r.rows1 = r1.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+        r.link1 = r1.link_bytes * link1_scale;
+        r.rows0 = r0.sm_hz * mmq_macs / macs;
+        r.rows1 = r1.sm_hz * mmq_macs / macs;
         r.sm_hz0 = r0.sm_hz;
     }
+    basalt::log::info("basalt deepseek41", "prompt share rates: links %.2f / %.2f GB/s, products %.0f / %.0f rows/s (%.0f MACs an SM-cycle)",
+                      rates_.empty() ? 0.0 : rates_[0].link0 / 1e9, rates_.empty() ? 0.0 : rates_[0].link1 / 1e9,
+                      rates_.empty() ? 0.0 : rates_[0].rows0, rates_.empty() ? 0.0 : rates_[0].rows1, mmq_macs);
     return true;
 }
 
@@ -987,6 +999,21 @@ bool ExpertTier::reclaim(std::string& err) {
     lent_per_layer_ = 0;
     owner_.assign(slot_bytes.size(), -1);
     busy_.assign(slot_bytes.size(), 0);
+    // BASALT_DS_RESEED=1 (read once; Lapilli, V100): the reopened slots take the most routed RAM experts at once, as at
+    // start, instead of filling one repeated miss at a time (the decode after a long read ran at ~40 % of its speed)
+    static const bool reseed = [] {
+        const char* e = std::getenv("BASALT_DS_RESEED");
+        return e != nullptr && e[0] == '1' && e[1] == 0;
+    }();
+    if (reseed && homes_.main == 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaDeviceSynchronize();   // the arena's zeroing is not ordered against the copy stream (as grow())
+        const int64_t promoted = promoted_;
+        seed_copies(n);
+        promoted_ = promoted;
+        basalt::log::info("basalt deepseek41", "VRAM expert tier reseeded: %lld experts per layer in %.0f ms", (long long) n,
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     return true;
 }
 

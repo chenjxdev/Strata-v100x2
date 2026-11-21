@@ -373,7 +373,7 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
 }
 
 // gate/up rows row, row + 1 (0 .. 2 n_ff: both gate or both up rows) of the expert at `blob`, entries [e0, e1)
-template<int TY, int KC = 80>
+template<int TY, int KC = 80, int NCMAX = (KC == 160 ? 3 : 6)>
 __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                      const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                      float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
@@ -394,8 +394,9 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
             rows2<TY, 3, KC>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
             e += 3;
         } else {
-            // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers
-            constexpr int kNC = KC == 160 ? 3 : 6;
+            // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers (NCMAX: 6 when a
+            // launch with fewer blocks an SM leaves the registers for it)
+            constexpr int kNC = NCMAX;
             const int m = min(n, kNC);
             rows2<TY, kNC, KC>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
             e += m;
@@ -404,17 +405,17 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
 }
 
 // pair() for a layer with gate rows of TG and up rows of TU: the up rows read TU's grid from the device table
-template<int TG, int TU, int KC = 80>
+template<int TG, int TU, int KC = 80, int NCMAX = (KC == 160 ? 3 : 6)>
 __device__ __forceinline__ void pair_gu(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                         const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                         float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
     if constexpr (TG != TU) {
         if (row >= L.n_ff) {
-            pair<TU, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
+            pair<TU, KC, NCMAX>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
             return;
         }
     }
-    pair<TG, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
+    pair<TG, KC, NCMAX>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
 }
 
 }  // namespace gu2
@@ -427,9 +428,10 @@ constexpr int GU2_ROWS = 16;   // rows per block: two a warp
 // IQ3_S's would spill); the 2560-value rows as they were
 template<int TG, int KC> inline constexpr int kGu2MinBlocks = KC == 160 && TG != 21 && TG != 22 ? 3 : 1;
 
-// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type; KC: calls a row.
-template<int TG, int TU = TG, int KC = 80>
-__global__ void __launch_bounds__(256, kGu2MinBlocks<TG, KC>)
+// native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride.  TU: the up rows' type; KC: calls a row;
+// MINB: blocks an SM at least (the registers a thread may take follow from it); NCMAX: entries a pass at most.
+template<int TG, int TU = TG, int KC = 80, int MINB = kGu2MinBlocks<TG, KC>, int NCMAX = (KC == 160 ? 3 : 6)>
+__global__ void __launch_bounds__(256, MINB)
 native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
                   const int32_t* __restrict__ grp_start,
                   const int32_t* __restrict__ n_groups,
@@ -447,7 +449,7 @@ native_gu2_kernel(const unsigned long long* __restrict__ grp_ptr,
     const int row = blockIdx.x * GU2_ROWS + 2 * warp;          // rows row, row + 1: both gate or both up
     if (row >= 2 * L.n_ff) return;
     for (int g = blockIdx.y; g < ng; g += gridDim.y)
-        gu2::pair_gu<TG, TU, KC>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate,
+        gu2::pair_gu<TG, TU, KC, NCMAX>((const uint8_t*) grp_ptr[g], row, grp_start[g], grp_start[g + 1], ent_tok, xq, L, gate,
                                  up, s_grid, lane);
 }
 

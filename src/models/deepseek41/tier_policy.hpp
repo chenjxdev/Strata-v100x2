@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace basalt::models::deepseek41::policy {
 
@@ -62,9 +63,26 @@ inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_sl
 /// Where the expert at routing rank `r` lives: the main card's homes first, then the head of the RAM tier when the
 /// main card's slots copy it (`copies` slots), the second card's homes, the rest of the RAM tier, the file.
 enum class Place { Main, Peer, Ram, File };
+/// BASALT_DS_DEAL (read once; Lapilli, V100): 1 spreads the second card's homes over the ranks the two cards hold
+/// (the main card's copies and the second card's homes) in proportion, so its share of the lookups follows its share of
+/// the slots; unset or any other value keeps the order below (the copies take the head of the routing order).
+inline int deal_spread() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("BASALT_DS_DEAL");
+        v = (e != nullptr && e[0] == '1' && e[1] == 0) ? 1 : 0;
+    }
+    return v;
+}
+
 inline Place place_of_rank(const Homes& h, int copies, int r) {
     if (r < h.main) return Place::Main;
     const int lead = h.main > 0 ? 0 : copies < h.ram ? copies : h.ram;
+    if (h.main == 0 && h.peer > 0 && lead > 0 && deal_spread() == 1) {
+        const int g = lead + h.peer;   // the ranks the two cards hold: h.peer of them go to the second card, evenly
+        if (r < g) return (int64_t) (r + 1) * h.peer / g > (int64_t) r * h.peer / g ? Place::Peer : Place::Ram;
+        return r < h.peer + h.ram ? Place::Ram : Place::File;
+    }
     if (r - h.main < lead) return Place::Ram;
     if (r - h.main - lead < h.peer) return Place::Peer;
     return r < h.main + h.peer + h.ram ? Place::Ram : Place::File;

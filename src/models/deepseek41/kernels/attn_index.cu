@@ -23,6 +23,7 @@
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/prefill_index.hpp"
 #include "cache_rows.cuh"
+#include "basalt/kernels/volta_compat.cuh"   // Lapilli: BASALT_CLUSTER_DIMS (no cluster attribute on Volta)
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -279,11 +280,14 @@ __device__ __forceinline__ float index_key_row(const uint16_t* __restrict__ w, c
 
 // Index key of a closed group: rms_norm(w_idx_k . comp) * norm_w, rotated at the group's first position. A cluster
 // of kKeyBlocks blocks per token splits the projection's rows; block 0 gathers them and finishes the key.
-__global__ void __cluster_dims__(kKeyBlocks, 1, 1) __launch_bounds__(32 * kKeyRows)
+__global__ void BASALT_CLUSTER_DIMS(kKeyBlocks, 1, 1) __launch_bounds__(32 * kKeyRows)
 index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
                  const int32_t* __restrict__ pos, int ratio, float eps,
                  const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
                  const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();   // no thread-block clusters before Hopper: the host launches index_key_nc_kernel instead
+#else
     const int t = blockIdx.y;
     const int row = row_of[t];
     if (row < 0) return;   // the whole cluster: it is one token's
@@ -302,6 +306,46 @@ index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__
     if (rank == 0 && threadIdx.x < kIdxDim) y[threadIdx.x] = cl.map_shared_rank(part, threadIdx.x / kKeyRows)[threadIdx.x % kKeyRows];
     cl.sync();   // the other blocks' rows are read: they may go
     if (rank != 0) return;
+    const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
+    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
+    const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
+    if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x < kIdxDim) {
+        const int c = threadIdx.x;
+        float o = y[c];
+        if (c >= kIdxDim - kRopeDim) {
+            const int p = (c - (kIdxDim - kRopeDim)) >> 1;
+            float x0 = y[kIdxDim - kRopeDim + 2 * p], x1 = y[kIdxDim - kRopeDim + 2 * p + 1];
+            rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
+            o = (c & 1) ? x1 : x0;
+        }
+        put_idx(o, c, comp_ik, (size_t) row, packed);
+    }
+#endif
+}
+
+// Lapilli (V100, no thread-block clusters): the same key with one block per token, each warp taking one row of every
+// kKeyBlocks group in turn. Same rows, same reductions, same finish as index_key_kernel's block 0.
+__global__ void __launch_bounds__(32 * kKeyRows)
+index_key_nc_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
+                    const int32_t* __restrict__ pos, int ratio, float eps,
+                    const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
+                    const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+    const int t = blockIdx.y;
+    const int row = row_of[t];
+    if (row < 0) return;
+    __shared__ float x[kLatent];
+    __shared__ float y[kIdxDim];
+    __shared__ float red[32];
+    for (int i = threadIdx.x; i < kLatent; i += blockDim.x) x[i] = comp_pre[(size_t) t * kLatent + i];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    for (int g = 0; g < kKeyBlocks; ++g) {
+        const float p = index_key_row(w, x, g * kKeyRows + warp);
+        if ((threadIdx.x & 31) == 0) y[g * kKeyRows + warp] = p;
+    }
+    __syncthreads();
     const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
     const float ss = block_sum(v * v, red);   // the threads past the key add zeros
     const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
@@ -959,6 +1003,51 @@ constexpr int kGemmM = 64, kGemmN = 64, kGemmK = 32, kGemmLd = kGemmK + 8, kGemm
 // (24 bits) so the product keeps fp32 accuracy; the weights are exact bf16.
 __global__ void __launch_bounds__(128) gemm_bf16_kernel(const uint16_t* __restrict__ w, const float* __restrict__ x,
                                                         int T, int in, int out, float* __restrict__ y) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Lapilli (V100): no bf16 tensor cores. The same tile in fp32 on the CUDA cores: exact products, fp32 sums.
+    __shared__ float xs[kGemmK][kGemmM + 1];
+    __shared__ float wf[kGemmK][kGemmN + 1];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * kGemmM, n0 = blockIdx.x * kGemmN;
+    const int tr = (tid >> 3) * 4, tc = (tid & 7) * 8;   // 4 rows x 8 columns per thread
+    float acc[4][8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < in; k0 += kGemmK) {
+        for (int i = tid; i < kGemmM * kGemmK; i += 128) {
+            const int r = i / kGemmK, c = i % kGemmK, m = m0 + r;
+            xs[c][r] = m < T ? x[(size_t) m * in + k0 + c] : 0.f;
+        }
+        for (int i = tid; i < kGemmN * kGemmK; i += 128) {
+            const int r = i / kGemmK, c = i % kGemmK, n = n0 + r;
+            wf[c][r] = n < out ? bf16_to_f32(w[(size_t) n * in + k0 + c]) : 0.f;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int k = 0; k < kGemmK; ++k) {
+            float a[4], b[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = xs[k][tr + i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) b[j] = wf[k][tc + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + tr + i;
+        if (m >= T) break;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (n0 + tc + j < out) y[(size_t) m * out + n0 + tc + j] = acc[i][j];
+    }
+#else
     __shared__ __align__(128) __nv_bfloat16 xh[kGemmM * kGemmLd];
     __shared__ __align__(128) __nv_bfloat16 xl[kGemmM * kGemmLd];
     __shared__ __align__(128) __nv_bfloat16 xm[kGemmM * kGemmLd];
@@ -1029,6 +1118,7 @@ __global__ void __launch_bounds__(128) gemm_bf16_kernel(const uint16_t* __restri
         for (int c = lane; c < kGemmN; c += 32)
             if (n0 + c < out) y[(size_t) m * out + n0 + c] = cs[(16 * warp + r) * kGemmCLd + c];
     }
+#endif
 }
 
 // A row of blockDim.x 16-byte words per block.
@@ -1146,12 +1236,31 @@ void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int
 }
 
 namespace {
+// Lapilli: thread-block clusters exist from compute capability 9.0 (read once per card).
+bool has_clusters() {
+    static int known[64] = {};   // per card: 0 not read yet, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    if (known[dev] == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) { (void) cudaGetLastError(); major = 0; }
+        known[dev] = major >= 9 ? 1 : -1;
+    }
+    return known[dev] > 0;
+}
+
 // The index keys of the groups the call closed.
 void index_keys(const CompressArgs& a, const float* pre, const int32_t* row_of, const int32_t* pos, int n_tokens,
                 cudaStream_t s) {
-    index_key_kernel<<<dim3(kKeyBlocks, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
-                                                                          a.idx_k_norm_w, a.rope_freq, a.comp_ik,
-                                                                          a.format == CacheFormat::Fp8);
+    if (has_clusters()) {
+        index_key_kernel<<<dim3(kKeyBlocks, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
+                                                                              a.idx_k_norm_w, a.rope_freq, a.comp_ik,
+                                                                              a.format == CacheFormat::Fp8);
+    } else {
+        index_key_nc_kernel<<<dim3(1, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
+                                                                        a.idx_k_norm_w, a.rope_freq, a.comp_ik,
+                                                                        a.format == CacheFormat::Fp8);
+    }
     check_launch("index_key");
 }
 }  // namespace
