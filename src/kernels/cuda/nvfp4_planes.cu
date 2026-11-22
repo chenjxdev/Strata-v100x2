@@ -113,7 +113,47 @@ __global__ void q8_to_planes_kernel(const uint8_t* __restrict__ blocks, int64_t 
     *reinterpret_cast<uint2*>(dst + r * (K / 2) + g * 8) = make_uint2(w[0], w[1]);
     dst[scale_offset(rows, K) + scale_index(r, g, K)] = (uint8_t) sb;
 }
+// (Lapilli, V100) One thread per (row, 32-value block): the E4M3 codes times the row's (or the matrix's) scale, rounded to
+// Q8_0 as ggml's reference rounds (roundf: halves away from zero).
+__global__ void e4m3_to_q8_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ row_scales,
+                                  const float* __restrict__ scale, int64_t rows, int64_t K, uint8_t* __restrict__ dst) {
+    const int64_t nb = K / 32;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * nb) return;
+    const int64_t r = i / nb;
+    const float sc = row_scales ? row_scales[r] : (scale ? *scale : 1.0f);
+    const uint8_t* c = codes + i * 32;
+    float x[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        x[j] = __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) c[j], __NV_E4M3))) * sc;
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* blk = dst + i * 34;   // ggml's block_q8_0: the FP16 d, then 32 int8 (34 bytes: d stays 2-byte aligned)
+    *reinterpret_cast<__half*>(blk) = __float2half(d);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) blk[2 + j] = (uint8_t) (int8_t) roundf(x[j] * id);
+}
 }  // namespace
+
+void e4m3_to_q8(const void* codes, const float* row_scales, const float* scale, int64_t rows, int64_t K, void* q8_blocks,
+                void* stream) {
+    if (rows <= 0 || K <= 0 || K % 32 != 0) {
+        basalt::log::error("basalt", "nvfp4p::e4m3_to_q8: a [%lld x %lld] matrix", (long long) rows, (long long) K);
+        std::exit(1);
+    }
+    const int64_t n = rows * (K / 32);
+    e4m3_to_q8_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const uint8_t*) codes, row_scales,
+                                                                                       scale, rows, K, (uint8_t*) q8_blocks);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "nvfp4p::e4m3_to_q8: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 void to_blocks(const void* planes, int64_t rows, int64_t K, void* blocks, void* stream) {
     if (!fits(rows, K)) {

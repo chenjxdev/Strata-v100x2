@@ -65,7 +65,9 @@ public:
         const size_t ng = (size_t) g.gdn_layers();
         if (ng) {
             st_.gdn = st_.gdn_first = st_.arena.take<float>(ng * st_.gdn_floats);
-            st_.gdn_alt = st_.arena.take<float>(ng * st_.gdn_floats);
+            // (Lapilli, V100) the second state buffer only where the recurrence writes it: dec_gdn_rec's cluster-free split
+            // launches write no state_out, so a card without block clusters commits every window instead
+            if (kernels::dec_gdn_clusters()) st_.gdn_alt = st_.arena.take<float>(ng * st_.gdn_floats);
             st_.rec_qkv = st_.arena.take<float>(ng * kWindow * C);
             st_.rec_h = st_.arena.take<float>(ng * kWindow * C);
             st_.rec_gate = st_.arena.take<float>(ng * kWindow * HV);

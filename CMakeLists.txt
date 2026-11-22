@@ -397,6 +397,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
+                        src/kernels/cuda/dense_mmvq.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)
@@ -757,6 +758,14 @@ endif()
 
 add_executable(dense_window_bench tests/kernels/dense_window_bench.cpp)
 target_link_libraries(dense_window_bench PRIVATE kernels mmq ${_gpu_runtime_target})
+add_executable(dense_mmvq_bench tests/kernels/dense_mmvq_bench.cpp tests/kernels/dense_mmvq_v0.cu tests/kernels/dense_bw_probe.cu)
+target_link_libraries(dense_mmvq_bench PRIVATE kernels mmq ${_gpu_runtime_target})
+add_executable(dense_forward_bench tests/kernels/dense_forward_bench.cpp tests/kernels/dense_bw_probe.cu)
+target_link_libraries(dense_forward_bench PRIVATE kernels ${_gpu_runtime_target})
+add_executable(dense_fused_parity tests/kernels/dense_fused_parity.cpp)
+target_link_libraries(dense_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME dense_fused_parity COMMAND dense_fused_parity)
+set_tests_properties(dense_fused_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(dense_ops_parity tests/kernels/dense_ops_parity.cpp)
 target_link_libraries(dense_ops_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_ops_parity COMMAND dense_ops_parity)

@@ -12,6 +12,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/program/qwen_forms.hpp"
 #include "models/qwen35/meta.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -401,10 +402,74 @@ private:
             auto sc = tensors_.find(base + ".scale");
             if (type == kTypeF8 && base == "output" && sc != tensors_.end() && (int64_t) sc->second.elements() == rows && rows > 1) {
                 l.row_scales = floats(gg, base + ".scale", rows, err);
-                return l.row_scales != nullptr;
+                if (!l.row_scales) return false;
+            } else {
+                l.scale = floats(gg, base + ".scale", 1, err);
+                if (!l.scale) return false;
             }
-            l.scale = floats(gg, base + ".scale", 1, err);
-            if (!l.scale) return false;
+        }
+        return dense::fp4_hardware() || to_mmq(base, l, err);
+    }
+
+    // (Lapilli, V100) A card without FP4 / FP8 tensor cores (before Blackwell) runs every product on MMQ: NVFP4 planes
+    // become ggml's NVFP4 blocks in place (the same bytes and codes; the tensor scale stays Linear::scale, which the step
+    // after MMQ applies), and an F8 matrix (the head) becomes Q8_0 with its row or tensor scale folded in, its E4M3 buffer
+    // given back.  The products' arithmetic changes (W4A8 / W8A8 against q8_1 rows): the quality gate measures it.
+    bool to_mmq(const std::string& base, dense::Linear& l, std::string& err) {
+        if (l.type == kTypeNvfp4Planes) {
+            if (!kernels::nvfp4p::fits(l.rows, l.cols)) {
+                err = "qwen35: " + base + " (" + std::to_string((long long) l.rows) + " x " + std::to_string((long long) l.cols) +
+                      ") has no NVFP4 block layout";
+                return false;
+            }
+            const size_t n = kernels::nvfp4p::bytes(l.rows, l.cols);
+            void* tmp = nullptr;
+            if (cudaMalloc(&tmp, n) != cudaSuccess) {
+                err = "qwen35: out of device memory turning " + base + " into NVFP4 blocks";
+                return false;
+            }
+            kernels::nvfp4p::to_blocks(l.w, l.rows, l.cols, tmp, nullptr);
+            const bool ok = cudaMemcpy(const_cast<void*>(l.w), tmp, n, cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                            cudaDeviceSynchronize() == cudaSuccess;
+            cudaFree(tmp);
+            if (!ok) {
+                err = "qwen35: turning " + base + " into NVFP4 blocks failed";
+                return false;
+            }
+            l.type = kTypeNvfp4;
+            return true;
+        }
+        if (l.type == kTypeF8) {
+            if (l.cols % 32 != 0) {
+                err = "qwen35: " + base + " has " + std::to_string((long long) l.cols) + " columns, not a multiple of 32 (Q8_0)";
+                return false;
+            }
+            const size_t n = (size_t) l.rows * (size_t) l.cols / 32 * 34, old = (size_t) l.rows * (size_t) l.cols;
+            void* q = nullptr;
+            if (cudaMalloc(&q, n) != cudaSuccess) {
+                err = "qwen35: out of device memory turning " + base + " into Q8_0";
+                return false;
+            }
+            kernels::nvfp4p::e4m3_to_q8(l.w, l.row_scales, l.scale, l.rows, l.cols, q, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                cudaFree(q);
+                err = "qwen35: turning " + base + " into Q8_0 failed";
+                return false;
+            }
+            auto it = std::find(dev_.begin(), dev_.end(), const_cast<void*>(l.w));
+            if (it != dev_.end()) {
+                cudaFree(*it);
+                dev_.erase(it);
+                dev_bytes_ -= old;
+            }
+            dev_.push_back(q);
+            dev_bytes_ += n;
+            l.w = q;
+            l.type = kTypeQ8_0;
+            l.scale = nullptr;
+            l.row_scales = nullptr;
+            basalt::log::info("basalt", "qwen35: %s in Q8_0 for this card (no FP8 tensor cores): %.2f GiB", base.c_str(),
+                              (double) n / 1073741824.0);
         }
         return true;
     }

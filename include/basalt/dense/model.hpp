@@ -27,6 +27,11 @@ enum class Mixer { Gdn, Attention };
 /// per value, rows of `cols` bytes) on the device; `scale` an NVFP4 or F8 matrix's fp32 tensor scale (device), null for 1.
 /// An NVFP4 product leaves the scale to the step after it; an F8 product applies it itself.  The head alone may be F8
 /// with a scale per row (`row_scales`, fp32 [rows] on the device, `scale` then null): it runs on the window gemm only.
+/// (Lapilli, V100) Whether the current card has the FP4 / FP8 block-scaled tensor cores the window gemm and the prompt
+/// line's FP4 / FP8 products need (compute capability 10 and up, Blackwell). Without them every product runs on MMQ: the
+/// pack's NVFP4 planes become ggml NVFP4 blocks and its F8 head Q8_0 at load (models/qwen35/adapter.cpp).
+bool fp4_hardware();
+
 struct Linear {
     int type = -1;
     const void* w = nullptr;

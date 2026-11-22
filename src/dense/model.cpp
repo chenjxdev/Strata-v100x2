@@ -2,6 +2,7 @@
 #include "internal.hpp"
 
 #include "basalt/kernels/gdn_prompt.hpp"
+#include "basalt/kernels/dense_mmvq.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
@@ -77,7 +78,13 @@ int64_t widest_input(const Geometry& g) {
 }
 // a window's activation buffers for the widest input: the window gemm's bf16 rows, MMQ's q8_1 rows
 size_t act_slot(const Geometry& g) { return (kernels::wgemm::act_bytes(widest_input(g)) + 255) / 256 * 256; }
-size_t q8_slot(const Geometry& g) { return (prefill::mmq::q8_bytes(kBatch, widest_input(g)) + 255) / 256 * 256; }
+// (Lapilli, V100) also the decode window's q8_1 rows for iq_mmvq or dense_mmvq (forward.cpp's wact): smaller, held anyway
+size_t q8_slot(const Geometry& g) {
+    const int64_t K = widest_input(g);
+    const size_t q8 = std::max({prefill::mmq::q8_bytes(kBatch, K), (size_t) kBatch * (size_t) (K / 32) * 36,
+                                kernels::dense_q8_bytes(K, kBatch)});
+    return (q8 + 255) / 256 * 256;
+}
 
 // The window gemm's split-K workspace for every call a window makes (forward.cpp): the groups and each matrix alone, in
 // either format (a superset is harmless).
@@ -163,6 +170,8 @@ bool decode_drafter(Model& m, std::string& err) {
     m.bd_dec = m.w.dflash;
     BlockDrafter& bd = m.bd_dec;
     if (!bd.present || m.o.drafter != Drafter::Block) return true;
+    // (Lapilli, V100) no FP4 / Q8-plane window gemm on this card: the drafter keeps its Q8_0 matrices, on MMQ
+    if (!fp4_hardware()) return true;
     void* tmp = nullptr;
     size_t tmp_bytes = 0;
     auto q8 = [](const Linear& l) { return l.type == 8 && l.cols % 256 == 0 && l.rows > 0; };
@@ -378,6 +387,13 @@ bool Model::ready_products(std::string& err) {
         for (const Linear* l : {&Lp->qkv, &Lp->z, &Lp->out, &Lp->q, &Lp->k, &Lp->v, &Lp->o, &Lp->gate, &Lp->up, &Lp->down})
             if (l->w) ls.push_back(l);
     for (const Linear* l : ls) {
+        // (Lapilli, V100) the window gemm's formats trap on a card without FP4 / FP8 tensor cores: refuse them here, by name,
+        // rather than stop on the first product (the qwen35 adapter turns the pack's into MMQ's at load)
+        if (!fp4_hardware() && (l->type == kTypeF8 || l->type == kTypeNvfp4Planes || l->type == kTypeQ8P)) {
+            err = o.arch + ": a " + std::to_string(l->rows) + "-row matrix is in a format this card's tensor cores cannot run (F8 or "
+                  "NVFP4 planes need compute capability 10); it should have become MMQ's at load";
+            return false;
+        }
         if (l->type == kTypeF8 || l->type == kTypeNvfp4Planes) continue;   // the window gemm's, not MMQ's
         if (!prefill::mmq::fits(l->type, l->rows)) {
             err = o.arch + ": the products have no tile for a " + std::to_string(l->rows) + "-row matrix";
@@ -592,6 +608,18 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     return m;
+}
+
+bool fp4_hardware() {
+    static int known[64] = {};   // per card: 0 not read yet, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    if (known[dev] == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) { (void) cudaGetLastError(); major = 0; }
+        known[dev] = major >= 10 ? 1 : -1;
+    }
+    return known[dev] > 0;
 }
 
 void destroy(Model* m) { delete m; }

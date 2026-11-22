@@ -2,6 +2,7 @@
 #include "internal.hpp"
 
 #include "basalt/kernels/gdn_prompt.hpp"
+#include "basalt/kernels/dense_mmvq.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -13,6 +14,7 @@
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <cstddef>
 #include <vector>
@@ -42,14 +44,66 @@ int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
 // the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes or F8, else all
 int64_t draft_vocab(const Model& m) {
     const Linear& hd = m.w.head;
-    return (hd.type == kTypeNvfp4Planes || hd.type == kTypeF8) && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
+    // (Lapilli, V100) a Q8_0 head on a card without FP8 tensor cores is the pack's F8 head turned at load (models/qwen35/
+    // adapter.cpp), rows in the same order: the drafter scores the same first rows as on the card the pack was made for
+    const bool lead = hd.type == kTypeNvfp4Planes || hd.type == kTypeF8 || (hd.type == kTypeQ8_0 && !fp4_hardware());
+    return lead && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
 }
 
 // rows 0..T-1 of x readied for products of `type`
+// (Lapilli, V100) A decode window's NVFP4 and Q8_0 products of up to kMmvqRows rows run on iq_mmvq where the card has no
+// FP4 tensor cores: dp4a, one warp per weight row, each weight part decoded once for every row of the window. MMQ's NVFP4
+// path there emulates int8 mma on tiles of 8 rows (one row: 18 tok/s, a third of what the weights' bytes allow). Its
+// activations are q8_1 rows (n_in / 32 blocks each), not MMQ's blocks: wact and mmq_run both read this one test, and every
+// decode-window product takes its activations from wact (wnorm, resid_act).  Prompt chunks (gemm, chunk_act) keep MMQ.
+// BASALT_DENSE_MMVQ_ROWS (read once, 0 to kBatch; default kBatch): the widest window off MMQ, 0 = MMQ for every window (the
+// same binary for an A/B). Measured on a V100 (27B), a verify window's median: iq_mmvq 29.9 / 32.0 / 40.6 /
+// 47.9 / 57.5 / 65.9 / 74.6 / 82.4 ms for 1 to 8 rows (each row re-reads its activations), MMQ 57.2 to 60.6 ms for any of
+// them (its 128-row tiles at one block an SM): 4 rows on iq_mmvq gave 56.5 / 152 / 50 j/s conv / struct / prose with the
+// block drafter, 0 gave 63 / 153 / 38.  dense_mmvq (below) beats MMQ at nearly every width up to 16 (its table says where).
+constexpr int kMmvqRows = kBatch;
+int mmvq_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("BASALT_DENSE_MMVQ_ROWS");
+        const int r = e && *e ? std::atoi(e) : kMmvqRows;
+        return r < 0 ? 0 : r > kBatch ? kBatch : r;
+    }();
+    return v;
+}
+// (Lapilli, V100) BASALT_DENSE_MMVQ_SPLIT (read once; default 1): those products on dense_mmvq, the same q8_1 values in a
+// layout whose 16 activation bytes a lane reads in one load at a constant offset per column (iq_mmvq's q8_1 blocks: four
+// loads over five cache lines each, hence the 8 ms each further row of a window cost); the same bits as iq_mmvq
+// (dense_mmvq_bench), at the widths where it beats MMQ (dense_mmvq_faster: its measured table), MMQ at the others.  0 =
+// iq_mmvq up to BASALT_DENSE_MMVQ_ROWS (an A/B on the same binary: 0 with 4 rows is the engine before dense_mmvq).
+bool mmvq_split_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BASALT_DENSE_MMVQ_SPLIT");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
+// where a decode window's product of `type` with `cols` inputs runs: wact and mmq_run ask with the same three (the layout
+// of dense_mmvq is the window's, T rows a chunk)
+enum class Route { Mmq, Iq, Dense };
+Route route(int type, int64_t cols, int T) {
+    if (!(type == kTypeNvfp4 || type == kTypeQ8_0) || T > mmvq_rows() || fp4_hardware()) return Route::Mmq;
+    if (!mmvq_split_on() || cols % kernels::kDenseChunk != 0 || T > kernels::kDenseMaxRows) return Route::Iq;
+    return kernels::dense_mmvq_faster(type, T) ? Route::Dense : Route::Mmq;
+}
+
 const void* wact(Model& m, const float* x, int type, int64_t cols, int T, cudaStream_t s) {
     if (on_wg(type)) {
         wg::pack(x, cols, cols, T, m.ws.xq, s);
         return m.ws.xq;
+    }
+    const Route r = route(type, cols, T);   // T q8_1 rows (iq_mmvq or dense_mmvq's layout), within the kBatch rows of q8_slot
+    if (r == Route::Dense) {
+        kernels::dense_quantize_q8(x, T, cols, m.ws.x8, s);
+        return m.ws.x8;
+    }
+    if (r == Route::Iq) {
+        kernels::quantize_q8_1_rows(x, T, cols, m.ws.x8, s);
+        return m.ws.x8;
     }
     prefill::mmq::quantize(x, nullptr, m.ws.x8, type, cols, cols, mmq_tile(T), s);
     return m.ws.x8;
@@ -64,12 +118,17 @@ const void* wnorm(Model& m, const float* x, const float* w, float* xn, int type,
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
 }
-// the same for BF16 rows (the residual)
+// the same for BF16 rows (the residual); on dense_mmvq's route the norm and the quantizer are one kernel (the same xn and
+// the same activations: dense_fused_parity)
 const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int type, int64_t cols, int T, float eps,
                   cudaStream_t s) {
     if (on_wg(type)) {
         wg::norm_pack(x, w, eps, cols, T, m.ws.xq, xn, s);
         return m.ws.xq;
+    }
+    if (route(type, cols, T) == Route::Dense) {
+        kernels::dense_norm_quantize(x, w, xn, eps, T, cols, m.ws.x8, s);
+        return m.ws.x8;
     }
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
@@ -87,6 +146,15 @@ void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
     kernels::to_bf16(m.ws.tmp, m.ws.x, (int64_t) T * H, s);
 }
 void mmq_run(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
+    const Route r = route(l.type, l.cols, T);   // y [T][rows], as MMQ leaves it (ld = rows); the tensor scale still the caller's
+    if (r == Route::Dense) {
+        kernels::dense_mmvq(l.type, l.w, xq, y, (int) l.cols, (int) l.rows, T, s);
+        return;
+    }
+    if (r == Route::Iq) {
+        kernels::iq_mmvq(l.type, l.w, xq, y, (int) l.cols, (int) l.rows, T, s);
+        return;
+    }
     prefill::mmq::Product p;
     p.w = l.w;
     p.type = l.type;
@@ -117,12 +185,17 @@ wg::Matrix wmat(const Linear& l, float* y) {
     return w;
 }
 
-// y [T][rows] = scale W x
+// y [T][rows] = scale W x (on dense_mmvq's route the scale is applied by the product's store: scale_values' multiply)
 void prod(Model& m, const Linear& l, const void* xq, float* y, int T, cudaStream_t s) {
     if (on_wg(l.type)) {
         wg::Call c = wcall(l);
         c.m[0] = wmat(l, y);
         wg::gemm(c, xq, T, m.ws.w8, s);
+        return;
+    }
+    if (route(l.type, l.cols, T) == Route::Dense) {
+        const kernels::DenseSeg sg{l.w, (int) l.rows, l.scale, y};
+        kernels::dense_mmvq_segs(l.type, &sg, 1, xq, (int) l.cols, T, s);
         return;
     }
     mmq_run(m, l, xq, y, T, s);
@@ -143,6 +216,17 @@ void prod_group(Model& m, const float* x, const void* xq, int type, std::initial
         wg::gemm(c, xq, T, m.ws.w8, s);
         return;
     }
+    // (Lapilli, V100) the matrices of one input on dense_mmvq's route: one launch, each with its scale (the same bits as
+    // one prod each; the small k and v rows share the launch with q)
+    bool dense = outs.size() <= (size_t) kernels::kDenseMaxSegs;
+    for (const Out& o : outs) dense = dense && o.l->type == type && o.l->cols == outs.begin()->l->cols;
+    if (dense && route(type, outs.begin()->l->cols, T) == Route::Dense) {
+        kernels::DenseSeg sg[kernels::kDenseMaxSegs];
+        int n = 0;
+        for (const Out& o : outs) sg[n++] = {o.l->w, (int) o.l->rows, o.l->scale, o.y};
+        kernels::dense_mmvq_segs(type, sg, n, xq, (int) outs.begin()->l->cols, T, s);
+        return;
+    }
     for (const Out& o : outs) {
         if (o.l->type != type) xq = wact(m, x, type = o.l->type, o.l->cols, T, s);
         prod(m, *o.l, xq, o.y, T, s);
@@ -155,6 +239,10 @@ void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cud
         c.m[0] = wmat(l, nullptr);
         c.m[0].y16 = x;
         wg::gemm(c, yq, T, m.ws.w8, s);
+        return;
+    }
+    if (route(l.type, l.cols, T) == Route::Dense) {   // the add in the product's store: add_scaled's FMUL, FADD, rounding
+        kernels::dense_mmvq_add_bf16(l.type, l.w, l.scale, yq, x, (int) l.cols, (int) l.rows, T, s);
         return;
     }
     mmq_run(m, l, yq, m.ws.tmp, T, s);
@@ -177,6 +265,10 @@ void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x,
     if (on_wg(gate.type)) {   // two products (their scales applied), then SwiGLU
         prod_group(m, x, xq, gate.type, {{&gate, b.g}, {&up, b.u}}, T, s);
         kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
+    } else if (up.type == gate.type && up.cols == gate.cols && route(gate.type, gate.cols, T) == Route::Dense) {
+        const kernels::DenseSeg sg[2] = {{gate.w, (int) gate.rows, nullptr, b.g}, {up.w, (int) up.rows, nullptr, b.u}};
+        kernels::dense_mmvq_segs(gate.type, sg, 2, xq, (int) gate.cols, T, s);   // one launch, the sums as mmq_run leaves them
+        kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
     } else {
         mmq_run(m, gate, xq, b.g, T, s);
         if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
@@ -213,6 +305,24 @@ void gemm(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
     p.dst = y;
     p.ld_dst = l.rows;
     m.mmq->run(p, s);
+}
+
+// (Lapilli) a prompt chunk product whose scale no later step applies (qkv, z, q, k, v): an NVFP4 matrix's on MMQ, here
+// (F8, NVFP4 planes and Q8_0 have none to apply: post_scale)
+void gemm_scaled(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
+    gemm(m, l, y, T, s);
+    if (const float* sc = post_scale(l)) kernels::scale_values(y, sc, (int64_t) T * l.rows, s);
+}
+// the GDN gates of a prompt chunk: gdn_gating_proj's cluster of blocks where the card has them, else (Lapilli, V100) the two
+// launches it fuses, bf16_rows_dot into cs.ab then gdn_gates: the same expressions, the product's sums in another order
+void gating(Model& m, const float* x, const Layer& L, int T, cudaStream_t s) {
+    const int64_t HV = m.g.gdn_v_heads, H = m.g.n_embd;
+    if (kernels::dec_gdn_clusters()) {
+        kernels::gdn_gating_proj(x, L.w_ab, L.dt, L.ssm_a, m.cs.gate, m.cs.beta, T, HV, H, s);
+        return;
+    }
+    kernels::bf16_rows_dot(x, L.w_ab, m.cs.ab, T, 2 * HV, H, s);
+    kernels::gdn_gates(m.cs.ab, L.dt, L.ssm_a, m.cs.gate, m.cs.beta, T, s);
 }
 
 // a prompt chunk's FP32 rows x readied for products of `type`: E4M3 (a scale per row) or MMQ's blocks in cs.xq; for NVFP4
@@ -303,6 +413,9 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     a.beta = st.rec_beta + (size_t) gi * kWindow * g.gdn_v_heads;
     if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;   // the out product's rows
     if (T == 1 && st.gdn_alt) a.state_out = st.gdn_alt + (size_t) gi * st.gdn_floats;   // the state after the row
+    // (Lapilli, V100) no block clusters: dec_gdn_rec's two launches write the raw output to a.o (the y rows, as qwen4exp's
+    // record_gdn does), and the session keeps no second state buffer (session.cpp: the split kernel writes no state_out)
+    if (!kernels::dec_gdn_clusters()) a.o = b.y;
     kernels::dec_gdn_rec(a, T, s);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
 }
@@ -315,6 +428,16 @@ void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
         prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
         prod_add(m, L.down, b.hq, b.x, T, s);
+        return;
+    }
+    // (Lapilli, V100) on dense_mmvq's route: gate and up in one launch, SwiGLU and down's quantizer in one kernel (h is not
+    // written: only down's activations read it), down's add in its store
+    if (L.up.type == L.gate.type && L.down.type == L.gate.type && route(L.gate.type, H, T) == Route::Dense &&
+        route(L.down.type, g.n_ff, T) == Route::Dense) {
+        const kernels::DenseSeg sg[2] = {{L.gate.w, (int) L.gate.rows, nullptr, b.g}, {L.up.w, (int) L.up.rows, nullptr, b.u}};
+        kernels::dense_mmvq_segs(L.gate.type, sg, 2, xq, H, T, s);
+        kernels::dense_swiglu_quantize(b.g, b.u, L.gate.scale, L.up.scale, T, L.gate.rows, b.x8, s);
+        prod_add(m, L.down, b.x8, b.x, T, s);
         return;
     }
     prod_swiglu(m, L.gate, L.up, b.xn, xq, b.h, T, s);
@@ -460,17 +583,17 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
     if (cells_only) {
         chunk_act(m, b.xn, L.k.type, H, T, s);
-        gemm(m, L.k, b.k, T, s);
-        gemm(m, L.v, b.v, T, s);
+        gemm_scaled(m, L.k, b.k, T, s);
+        gemm_scaled(m, L.v, b.v, T, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
                                  256, true, 0, nullptr, q8, far_kv);
         return;
     }
     chunk_act(m, b.xn, L.q.type, H, T, s);
-    gemm(m, L.q, b.qfull, T, s);
+    gemm_scaled(m, L.q, b.qfull, T, s);
     if (L.k.type != L.q.type) chunk_act(m, b.xn, L.k.type, H, T, s);
-    gemm(m, L.k, b.k, T, s);
-    gemm(m, L.v, b.v, T, s);
+    gemm_scaled(m, L.k, b.k, T, s);
+    gemm_scaled(m, L.v, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8, far_kv);
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
@@ -515,11 +638,11 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     {
         kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
         chunk_act(m, b.xn, L.qkv.type, H, T, s);
-        gemm(m, L.qkv, b.qkv, T, s);
+        gemm_scaled(m, L.qkv, b.qkv, T, s);
         if (L.z.type != L.qkv.type) chunk_act(m, b.xn, L.z.type, H, T, s);
-        gemm(m, L.z, b.z, T, s);
+        gemm_scaled(m, L.z, b.z, T, s);
     }
-    kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
+    gating(m, b.xn, L, T, s);
     kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
     chunk_residual(m, L.out, b.yn, VD, T, s);
@@ -1057,7 +1180,11 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
     const int64_t nv = draft_vocab(m);
     const void* hq = wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s);
-    if (nv < g.n_vocab) {
+    if (nv < g.n_vocab && !on_wg(m.w.head.type)) {
+        Linear first = m.w.head;   // (Lapilli, V100) a Q8_0 head on MMQ: its first nv rows lead, a matrix of their own
+        first.rows = nv;
+        prod(m, first, hq, b.hl, R, s);
+    } else if (nv < g.n_vocab) {
         const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
         wg::Call c = wcall(hd);
         c.m[0] = wmat(hd, b.hl);

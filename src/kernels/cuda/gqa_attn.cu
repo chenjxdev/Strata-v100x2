@@ -928,6 +928,11 @@ I8Plan plan_prompt_i8(int n_head, int64_t T, int64_t cells, size_t split_floats)
     const auto waves = [&](int64_t blocks) { return (double) ((blocks + sms - 1) / sms); };
     const double keys = (double) cells;
     I8Plan best{4, 1};
+    // (Lapilli, V100) the 8-warp kernel's shared memory (100,352 bytes at head_dim 256) is above a V100's opt-in limit
+    // (98,304): there the 4-warp kernel (83,968) takes every chunk, unsplit
+    int optin = 0;
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (optin < i8_smem<8>()) return best;
     double best_cost = waves((T + 63) / 64 * n_head) * 0.8 * keys;
     const int64_t blocks = (T + 127) / 128 * n_head;
     for (int s = 1; s <= kMaxSplits; ++s) {

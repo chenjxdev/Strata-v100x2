@@ -287,6 +287,11 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             ggml_cuda_mmq_load_tiles_q5_K_dp4a<type, J, fallback>,
             ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a<type, J, fallback>,
             ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+    } else if constexpr (ggml_cuda_mmq_dp4a_type(type) && type == GGML_TYPE_NVFP4) {   // (Lapilli, V100)
+        return ggml_cuda_mmq_util_funcs(
+            ggml_cuda_mmq_load_tiles_nvfp4_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_vec_dot_nvfp4_q8_1_dp4a<type, J, fallback>,
+            ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
     }
     switch (type) {
         case GGML_TYPE_Q2_0:

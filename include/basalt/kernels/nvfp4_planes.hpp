@@ -49,5 +49,11 @@ void from_q8(const void* q8_blocks, int64_t rows, int64_t K, void* planes, float
 
 /// The ggml NVFP4 blocks of a plane matrix, for products that read blocks (distinct buffers, `bytes` each).
 void to_blocks(const void* planes, int64_t rows, int64_t K, void* blocks, void* stream);
+/// (Lapilli, V100) An F8_E4M3 matrix (rows x K codes, K % 32 == 0) times its scale - one per row (`row_scales`, device FP32
+/// [rows]) or the matrix's (`scale`, device FP32 [1]) - rounded to ggml's Q8_0 blocks in `q8_blocks` (rows * K / 32 * 34
+/// bytes), as quantize_row_q8_0_ref rounds: d = amax / 127 (stored FP16), q = round(x / d).  For a card without FP8 tensor
+/// cores, whose products then run on MMQ.
+void e4m3_to_q8(const void* codes, const float* row_scales, const float* scale, int64_t rows, int64_t K, void* q8_blocks,
+                void* stream);
 
 }  // namespace basalt::kernels::nvfp4p

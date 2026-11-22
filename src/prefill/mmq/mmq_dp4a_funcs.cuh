@@ -478,6 +478,89 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// (Lapilli, V100) NVFP4 on the dp4a path, in the shape of Q8_0's functions above: the tile holds the E2M1 codes as int8
+// values (kvalues_fp4, which doubles them) in Q8_0's layout, 64 ints a row, and one float per 16-value sub-block (the UE4M3
+// scale halved: ggml_cuda_mmq_nvfp4_scale, as the mma loader), 16 a row plus one of padding. The dot takes each 32-value
+// q8_1 block (D4 layout: one d per block) as two 16-value halves, each times its sub-block's scale.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4_dp4a(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_NVFP4, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+
+    constexpr int nsub            = QK_NVFP4 / QK_NVFP4_SUB;      // 4 sub-blocks a block
+    constexpr int threads_per_row = MMQ_ITER_K / QK_NVFP4_SUB;    // 16: one sub-block each
+    constexpr int nrows           = warp_size / threads_per_row;  // 2 rows a warp
+    const int txi = threadIdx.x % threads_per_row;
+    const int kbx = txi / nsub;   // block within the tile row
+    const int sb  = txi % nsub;   // sub-block within the block
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_nvfp4 * bxi = (const block_nvfp4 *) x + kbx0 + i*stride + kbx;
+
+        // byte j of a sub-block holds value j (low nibble) and value j + 8 (high nibble): v0 = values 0-3 and 8-11,
+        // v1 = values 4-7 and 12-15; stored in value order, as the mma loader does
+        const int2 v0 = get_int_from_table_16(get_int_b4(bxi->qs, 2*sb + 0), kvalues_fp4);
+        const int2 v1 = get_int_from_table_16(get_int_b4(bxi->qs, 2*sb + 1), kvalues_fp4);
+        int * q = x_qs + i*(2*MMQ_TILE_NE_K + 1) + 4*txi;
+        q[0] = v0.x;
+        q[1] = v1.x;
+        q[2] = v0.y;
+        q[3] = v1.y;
+        x_df[i*(2*MMQ_TILE_NE_K/4 + 1) + txi] = ggml_cuda_mmq_nvfp4_scale(bxi->d[sb]);
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_q8_1_dp4a(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_NVFP4, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_NVFP4_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                const int * xq = &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0];
+                const int * yq = &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K];
+                int s0 = 0;
+                int s1 = 0;
+#pragma unroll
+                for (int l = 0; l < VDR_NVFP4_Q8_1_MMQ/2; ++l) {
+                    s0 = ggml_cuda_dp4a(xq[l],                        yq[l],                        s0);
+                    s1 = ggml_cuda_dp4a(xq[l + VDR_NVFP4_Q8_1_MMQ/2], yq[l + VDR_NVFP4_Q8_1_MMQ/2], s1);
+                }
+                const float * dx = &x_df[i*(2*MMQ_TILE_NE_K/4 + 1) + k0/4];
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)] *
+                    (dx[0]*(float) s0 + dx[1]*(float) s1);
+            }
+        }
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
