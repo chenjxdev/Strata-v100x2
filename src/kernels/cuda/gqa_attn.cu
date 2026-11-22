@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include "basalt/log.hpp"
 #include "basalt/kernels/volta_compat.cuh"
 
@@ -1215,6 +1216,20 @@ __global__ void wmma_acc_layout_kernel(float* out) {
     for (int e = 0; e < 8 && e < acc.num_elements; ++e) out[threadIdx.x * 8 + e] = acc.x[e];
 }
 
+// the prompt kernel on Volta: prompt_wmma_kernel, the default (the 27B, 100 blocks of the quality gate: the
+// same KLD, +0.000008 +/- 0.000091 row by row; reading +18 % at 16K, +33 % at 32K); BASALT_ATTN_PROMPT=i8 (read once) or
+// gqa_set_prompt_wmma(2): the int8 kernel (or the fp16 one); gqa_set_prompt_wmma(1): on, 0: as the variable says
+int g_prompt_wmma = 0;
+bool prompt_wmma_on() {
+    if (!volta_decode()) return false;
+    if (g_prompt_wmma == 1 || g_prompt_wmma == 2) return g_prompt_wmma == 1;
+    static const bool on = [] {
+        const char* e = std::getenv("BASALT_ATTN_PROMPT");
+        return !(e && std::strcmp(e, "i8") == 0);
+    }();
+    return on;
+}
+
 // the decode kernel on Volta: 3 = decode_wmma3_kernel (one pass, the default), 2 = decode_wmma2_kernel, 1 =
 // decode_wmma_kernel (2 and 1: the same bits, two passes); BASALT_ATTN_V (read once), or gqa_set_decode_variant (the test)
 int g_decode_variant = 0;
@@ -1471,6 +1486,184 @@ __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __res
         if (pos_a < T) *reinterpret_cast<float2*>(out + (pos_a * n_head + head_a) * HD + col) = make_float2(o[n][0] * ia, o[n][1] * ia);
         if (pos_b < T) *reinterpret_cast<float2*>(out + (pos_b * n_head + head_b) * HD + col) = make_float2(o[n][2] * ib, o[n][3] * ib);
     }
+}
+
+// ---------------------------------------------------------------- prompt on Volta's tensor cores
+// prompt_wmma_kernel: prompt_f16_kernel's tiling (block = 16 positions x the KV group's 6 heads, 96 rows; warp w rows
+// 16 w ..; cells by tiles of 32, read once for the block) on nvcuda::wmma 16x16x16 (fp16 in, fp32 accumulate: the
+// V100's own tensor cores, where the m16n8 mma and ldmatrix of both prompt kernels are emulated), for the fp16 AND the
+// int8 cache (K and V decoded to fp16 as the decode kernels decode them: code x scale rounded once).  Q x 1/sqrt(HD)
+// log2(e) in fp16 (the decode kernels' queries), S kept in two accumulator fragments, the online softmax of a row over
+// its 4 lanes (Volta's accumulator layout, measured: a lane holds rows r0 and r0 + 2; the 4 lanes of a row differ in
+// bits 1 and 3), P through a warp tile into A's layout, O = O alpha + P V accumulated in fp32 (the fp16 kernel sums a
+// tile's P V in fp16).  Another rounding than the int8 prompt kernel (which rounds Q and P to 8 bits): the decode path's
+// kind of arithmetic.  The default on Volta (prompt_wmma_on: BASALT_ATTN_PROMPT=i8 for the int8 kernel).
+constexpr int WNW = 6, WROWS = 16 * WNW, WBN = 32;
+struct PromptSmemW {
+    __half q[WROWS][LDH];
+    __half k[WBN][LDH];
+    __half v[WBN][LDH];
+    __half p[WNW][16][WBN + 8];
+};
+
+__global__ void __launch_bounds__(WNW * 32, 1) prompt_wmma_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
+                                                                 const __half* __restrict__ vc, KvInt8 q8, int n_head, int n_kv,
+                                                                 int64_t pos0, int64_t T, float* __restrict__ out, KvFar far_kv) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+    PromptSmemW& sm = *reinterpret_cast<PromptSmemW*>(smem_raw);
+    constexpr int NDF = HD / 16;   // the warp's 16-dim output fragments
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int G = n_head / n_kv, PB = WROWS / G;
+    const int kvh = blockIdx.y;
+    const int64_t q0 = (int64_t) (gridDim.x - 1 - blockIdx.x) * PB;   // the longest tiles first
+    const int64_t last_pos = min(T, q0 + PB) - 1;
+    const int64_t cells = pos0 + last_pos + 1;
+    const bool i8 = q8.k != nullptr;
+    const float scale = kScaleLog2;
+    for (int i = tid; i < WROWS * HD / 4; i += WNW * 32) {
+        const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
+        const int64_t pos = q0 + r / G;
+        const int head = kvh * G + r % G;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (pos < T) v = *reinterpret_cast<const float4*>(q + (pos * n_head + head) * HD + c);
+        *reinterpret_cast<__half2*>(&sm.q[r][c]) = __floats2half2_rn(v.x * scale, v.y * scale);
+        *reinterpret_cast<__half2*>(&sm.q[r][c + 2]) = __floats2half2_rn(v.z * scale, v.w * scale);
+    }
+    // the lane's two rows of the warp's 16 (accumulator elements 0, 1, 4, 5 and 2, 3, 6, 7) and their positions
+    const int r0 = (lane & 1) + 8 * ((lane >> 2) & 1) + 4 * ((lane >> 4) & 1);
+    const int ra = warp * 16 + r0, rb = ra + 2;
+    const int64_t pos_a = q0 + ra / G, pos_b = q0 + rb / G;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[NDF];
+#pragma unroll
+    for (int j = 0; j < NDF; ++j) wmma::fill_fragment(fo[j], 0.0f);
+    float m_a = kNeg, m_b = kNeg, l_a = 0.0f, l_b = 0.0f;
+    const int n_tiles = (int) ((cells + WBN - 1) / WBN);
+    for (int ti = 0; ti < n_tiles; ++ti) {
+        const int64_t c0 = (int64_t) ti * WBN;
+        __syncthreads();   // the previous tile is consumed (and the queries are written)
+        for (int i = tid; i < WBN * HD / 8; i += WNW * 32) {   // 8 values a step, fp16 in shared memory
+            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            const bool ok = c0 + r < cells;
+            uint4 kw = make_uint4(0, 0, 0, 0), vw = kw;
+            if (ok) {
+                int64_t cell = c0 + r;
+                const bool fa = kv_far(far_kv, cell);
+                const int64_t row = cell * n_kv + kvh;
+                if (i8) {
+                    const KvInt8& c8 = fa ? far_kv.q8 : q8;
+                    const int2 kb = *reinterpret_cast<const int2*>(c8.k + row * HD + c);
+                    const int2 vb = *reinterpret_cast<const int2*>(c8.v + row * HD + c);
+                    const __half ksh = __ushort_as_half(c8.ks[row * (HD / 64) + c / 64]);
+                    const __half vsh = __ushort_as_half(c8.vs[row * (HD / 64) + c / 64]);
+                    const __half2 ks2 = __halves2half2(ksh, ksh), vs2 = __halves2half2(vsh, vsh);
+                    __half2 h[4];
+                    i8x4_to_half((unsigned) kb.x, h[0], h[1]);
+                    i8x4_to_half((unsigned) kb.y, h[2], h[3]);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) h[e] = __hmul2(h[e], ks2);
+                    kw = *reinterpret_cast<uint4*>(h);
+                    i8x4_to_half((unsigned) vb.x, h[0], h[1]);
+                    i8x4_to_half((unsigned) vb.y, h[2], h[3]);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) h[e] = __hmul2(h[e], vs2);
+                    vw = *reinterpret_cast<uint4*>(h);
+                } else {
+                    kw = *reinterpret_cast<const uint4*>((fa ? (const __half*) far_kv.k : kc) + row * HD + c);
+                    vw = *reinterpret_cast<const uint4*>((fa ? (const __half*) far_kv.v : vc) + row * HD + c);
+                }
+            }
+            *reinterpret_cast<uint4*>(&sm.k[r][c]) = kw;
+            *reinterpret_cast<uint4*>(&sm.v[r][c]) = vw;
+        }
+        __syncthreads();
+        if ((int64_t) warp * 16 / G + q0 >= T) continue;   // the warp's rows are past the chunk (it keeps the barriers)
+        // S = Q K^T: the warp's 16 rows, cells 0..15 and 16..31
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs[2];
+        wmma::fill_fragment(fs[0], 0.0f);
+        wmma::fill_fragment(fs[1], 0.0f);
+#pragma unroll
+        for (int k = 0; k < HD; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+            wmma::load_matrix_sync(fa, &sm.q[warp * 16][k], LDH);
+#pragma unroll
+            for (int ct = 0; ct < 2; ++ct) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, &sm.k[ct * 16][k], LDH);
+                wmma::mma_sync(fs[ct], fa, fb, fs[ct]);
+            }
+        }
+        // the mask, then the online softmax: element e of fragment ct is row r0 + (e & 2), cell
+        // 16 ct + 8 ((lane >> 3) & 1) + 4 (e >> 2) + (lane & 2) + (e & 1)
+        float mx_a = -INFINITY, mx_b = -INFINITY;
+#pragma unroll
+        for (int ct = 0; ct < 2; ++ct)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int64_t cell = c0 + 16 * ct + 8 * ((lane >> 3) & 1) + 4 * (e >> 2) + (lane & 2) + (e & 1);
+                const int64_t pos = (e & 2) ? pos_b : pos_a;
+                const bool vis = cell <= pos0 + pos && cell < cells;
+                fs[ct].x[e] = vis ? fs[ct].x[e] : -INFINITY;
+                if (e & 2) mx_b = fmaxf(mx_b, fs[ct].x[e]);
+                else mx_a = fmaxf(mx_a, fs[ct].x[e]);
+            }
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 2));
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 8));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 2));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 8));
+        const float na = fmaxf(m_a, mx_a), nb = fmaxf(m_b, mx_b);
+        const float al_a = exp2f(m_a - na), al_b = exp2f(m_b - nb);
+        m_a = na;
+        m_b = nb;
+        float ps_a = 0.0f, ps_b = 0.0f;
+        __half (*pw)[WBN + 8] = sm.p[warp];
+#pragma unroll
+        for (int ct = 0; ct < 2; ++ct)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float pr = fs[ct].x[e] == -INFINITY ? 0.0f : exp2f(fs[ct].x[e] - ((e & 2) ? m_b : m_a));
+                if (e & 2) ps_b += pr;
+                else ps_a += pr;
+                pw[r0 + (e & 2)][16 * ct + 8 * ((lane >> 3) & 1) + 4 * (e >> 2) + (lane & 2) + (e & 1)] = __float2half_rn(pr);
+            }
+        ps_a += __shfl_xor_sync(0xffffffffu, ps_a, 2);
+        ps_a += __shfl_xor_sync(0xffffffffu, ps_a, 8);
+        ps_b += __shfl_xor_sync(0xffffffffu, ps_b, 2);
+        ps_b += __shfl_xor_sync(0xffffffffu, ps_b, 8);
+        l_a = fmaf(l_a, al_a, ps_a);
+        l_b = fmaf(l_b, al_b, ps_b);
+        __syncwarp();
+        // O = O alpha + P V
+#pragma unroll
+        for (int j = 0; j < NDF; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) fo[j].x[e] *= (e & 2) ? al_b : al_a;
+#pragma unroll
+        for (int kk = 0; kk < WBN; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+            wmma::load_matrix_sync(fp, &pw[0][kk], WBN + 8);
+#pragma unroll
+            for (int j = 0; j < NDF; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
+                wmma::load_matrix_sync(fv, &sm.v[kk][16 * j], LDH);
+                wmma::mma_sync(fo[j], fp, fv, fo[j]);
+            }
+        }
+        __syncwarp();   // the P tile is free for the next tile
+    }
+    const float ia = l_a > 0.0f ? 1.0f / l_a : 0.0f, ib = l_b > 0.0f ? 1.0f / l_b : 0.0f;
+    const int head_a = kvh * G + ra % G, head_b = kvh * G + rb % G;
+#pragma unroll
+    for (int j = 0; j < NDF; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {   // element e: row r0 + (e & 2), dim 16 j + 8 ((lane >> 3) & 1) + 4 (e >> 2) + (lane & 2) + (e & 1)
+            const int d = 16 * j + 8 * ((lane >> 3) & 1) + 4 * (e >> 2) + (lane & 2) + (e & 1);
+            if (e & 2) {
+                if (pos_b < T) out[(pos_b * n_head + head_b) * HD + d] = fo[j].x[e] * ib;
+            } else {
+                if (pos_a < T) out[(pos_a * n_head + head_a) * HD + d] = fo[j].x[e] * ia;
+            }
+        }
 }
 
 // ---------------------------------------------------------------- prompt, int8 cache
@@ -1892,6 +2085,7 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 }
 
 void gqa_set_decode_variant(int v) { g_decode_variant = v; }
+void gqa_set_prompt_wmma(int v) { g_prompt_wmma = v; }
 
 bool gqa_wmma_layout_ok() {
     float* d = nullptr;
@@ -2010,6 +2204,24 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         std::exit(1);
     }
     const cudaStream_t st = (cudaStream_t) stream;
+    if (prompt_wmma_on() && WROWS % (n_head / n_kv) == 0) {   // Volta's tensor cores, both caches (until it is chosen: an option)
+        static std::atomic<bool> raised_w[64];
+        const int dev = opt_in_device();
+        if (!raised_w[dev].load(std::memory_order_acquire)) {
+            if (cudaFuncSetAttribute(prompt_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmemW)) !=
+                cudaSuccess) {
+                basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed (tensor cores)");
+                std::exit(1);
+            }
+            raised_w[dev].store(true, std::memory_order_release);
+        }
+        const int pb = WROWS / (n_head / n_kv);
+        const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
+        prompt_wmma_kernel<<<grid, WNW * 32, sizeof(PromptSmemW), st>>>(q, (const __half*) k_cache, (const __half*) v_cache, q8, n_head,
+                                                                         n_kv, pos0, T, out, far_kv);
+        check("gqa_prompt_attn (tensor cores)");
+        return;
+    }
     if (q8.k) {
         const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
         if (p.warps == 4) launch_prompt_i8<4, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);

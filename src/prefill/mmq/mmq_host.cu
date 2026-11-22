@@ -4,6 +4,7 @@
 
 #include <cuda.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -13,6 +14,22 @@
 [[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     basalt::log::error("basalt", "mmq: %s: %s\n  in %s at %s:%d", msg, stmt, func, file, line);
     std::abort();
+}
+
+// (Lapilli, V100) mmq.cuh's variant 1 (NVFP4 on the tensor cores, bitwise the dp4a path's results; the
+// default): 1 on, 2 off, 0 as BASALT_MMQ_HMMA says (read once: 0 turns it off, unset leaves it on)
+namespace {
+std::atomic<int> g_mmq_hmma{0};
+}
+void mmq_hmma_set(int mode) { g_mmq_hmma.store(mode, std::memory_order_relaxed); }
+bool mmq_hmma_on() {
+    const int m = g_mmq_hmma.load(std::memory_order_relaxed);
+    if (m == 1 || m == 2) return m == 1;
+    static const bool env = [] {
+        const char * e = std::getenv("BASALT_MMQ_HMMA");
+        return !(e != nullptr && e[0] == '0' && e[1] == 0);
+    }();
+    return env;
 }
 
 int ggml_cuda_get_device() {

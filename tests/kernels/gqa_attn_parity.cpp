@@ -374,7 +374,8 @@ int main(int argc, char** argv) {
         }
         cudaFree(d_k2); cudaFree(d_v2); cudaFree(d_s2); cudaFree(d_at);
     }
-    // prompt chunk
+    // prompt chunk (the fp16 and int8 prompt kernels here, prompt_wmma_kernel in its own blocks: it is Volta's default)
+    basalt::kernels::gqa_set_prompt_wmma(2);
     basalt::kernels::gqa_prompt_attn(d_q, d_kc, d_vc, NH, NKV, p0, TP, d_out, nullptr);
     std::vector<float> pr(q.size());
     ck(cudaMemcpy(pr.data(), d_out, pr.size() * 4, cudaMemcpyDeviceToHost), "copy");
@@ -383,6 +384,18 @@ int main(int argc, char** argv) {
         for (int j = 0; j < NH * HD; ++j) ep.add(pr[(size_t) rows[i] * NH * HD + j], want[i][(size_t) j]);
     std::printf("gqa_prompt_attn: max abs %.3g rel %.3g vs double (fp16 q and p)\n", ep.abs, ep.rel);
     if (ep.abs > 5e-3) ++fails;
+    {   // the prompt on Volta's tensor cores (prompt_wmma_kernel), the same chunk
+        basalt::kernels::gqa_set_prompt_wmma(1);
+        basalt::kernels::gqa_prompt_attn(d_q, d_kc, d_vc, NH, NKV, p0, TP, d_out, nullptr);
+        basalt::kernels::gqa_set_prompt_wmma(2);
+        std::vector<float> pw(q.size());
+        ck(cudaMemcpy(pw.data(), d_out, pw.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        Err ew;
+        for (size_t i = 0; i < rows.size(); ++i)
+            for (int j = 0; j < NH * HD; ++j) ew.add(pw[(size_t) rows[i] * NH * HD + j], want[i][(size_t) j]);
+        std::printf("gqa_prompt_attn, tensor cores: max abs %.3g rel %.3g vs double (fp16 q and p, fp32 sums)\n", ew.abs, ew.rel);
+        if (ew.abs > 5e-3) ++fails;
+    }
 
     // ---- int8 cache: the same cells as codes and per-64 scales (the write kernel's rule), against the reference on the
     // dequantized values
@@ -502,6 +515,48 @@ int main(int argc, char** argv) {
             // 64-cell tile (half a step of 1/255 of the tile's largest product each), summed exactly in int32
             if (p8q.abs > 2e-2 || p8.abs > 3e-2) ++fails;
         }
+        {   // the prompt on the tensor cores: the same chunks against the dequantized cells, then the 2048 rows
+            // read in one, two and three chunks: each row bitwise the same (a row's result never depends on its chunk)
+            basalt::kernels::gqa_set_prompt_wmma(1);
+            for (int cfg : {0, 2}) {
+                const int T = cfg < 2 ? TP : TB;
+                const int64_t pp = L - T;
+                const float* qh = cfg < 2 ? q.data() : qb.data();
+                basalt::kernels::gqa_prompt_attn(cfg < 2 ? d_q : d_qb, nullptr, nullptr, NH, NKV, pp, T, d_ob, nullptr, q8);
+                std::vector<float> po((size_t) T * NH * HD);
+                ck(cudaMemcpy(po.data(), d_ob, po.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                Err pw;
+                for (const int r : {0, 1, 15, 16, 17, 31, 32, 33, 57, 63, 64, 65, 127, 128, 255, T - 2, T - 1, 1000, 2047}) {
+                    if (r >= T) continue;
+                    ref8(&qh[(size_t) r * NH * HD], pp + r + 1, w8.data(), w8q.data());
+                    for (int j = 0; j < NH * HD; ++j) pw.add(po[(size_t) r * NH * HD + j], w8[(size_t) j]);
+                }
+                std::printf("int8 cache, tensor cores: prompt %s max abs %.3g rel %.3g vs double on the dequantized cells\n",
+                            cfg < 2 ? "300 rows" : "2048 rows", pw.abs, pw.rel);
+                if (pw.abs > 5e-3) ++fails;
+            }
+            std::vector<float> one((size_t) TB * NH * HD), cut(one.size());
+            const int64_t pp = L - TB;
+            basalt::kernels::gqa_prompt_attn(d_qb, nullptr, nullptr, NH, NKV, pp, TB, d_ob, nullptr, q8);
+            ck(cudaMemcpy(one.data(), d_ob, one.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            bool same = true;
+            for (const std::vector<int>& parts : {std::vector<int>{1000, 1048}, std::vector<int>{17, 500, 1531}, std::vector<int>{1, 2047}}) {
+                int r0 = 0;
+                for (const int n : parts) {
+                    basalt::kernels::gqa_prompt_attn(d_qb + (size_t) r0 * NH * HD, nullptr, nullptr, NH, NKV, pp + r0, n,
+                                                     d_ob + (size_t) r0 * NH * HD, nullptr, q8);
+                    r0 += n;
+                }
+                ck(cudaMemcpy(cut.data(), d_ob, cut.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                if (std::memcmp(one.data(), cut.data(), one.size() * 4) != 0) {
+                    same = false;
+                    std::printf("  tensor-core prompt: %zu chunks differ from one\n", parts.size());
+                }
+            }
+            basalt::kernels::gqa_set_prompt_wmma(2);
+            std::printf("int8 cache, tensor cores: 2048 rows in one, two and three chunks bitwise the same: %s\n", same ? "yes" : "NO");
+            if (!same) ++fails;
+        }
         cudaFree(d_qb);
         cudaFree(d_ob);
         cudaFree(d_split);
@@ -531,7 +586,7 @@ int main(int argc, char** argv) {
     std::printf("bench: decode 1 row x %lld cells %.1f us (%.0f GB/s of K/V); prompt %d rows %.1f us (%.1f TFLOP/s)\n",
                 (long long) L, us_dec, bytes / us_dec / 1e3, TP, us_pr, flops / us_pr / 1e6);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {   // a 2048-row chunk at the end of 4K and 16K caches, fp16 and int8
-        for (const int64_t cells : {4096, 16384}) {
+        for (const int64_t cells : {4096, 16384, 32768}) {
             const int64_t T2 = 2048, pp = cells - T2;
             uint16_t* bk = dev<uint16_t>((size_t) cells * NKV * HD);
             uint16_t* bv = dev<uint16_t>((size_t) cells * NKV * HD);
@@ -554,22 +609,62 @@ int main(int argc, char** argv) {
             // fp16, int8, int8 with scratch for three key splits
             const size_t sf = basalt::kernels::gqa_prompt_split_floats(T2, NH, 3);
             float* bs = dev<float>(sf);
-            for (int run = 0; run < 3; ++run) {
-                const basalt::kernels::KvInt8 kv = run ? b8 : basalt::kernels::KvInt8{};
+            for (int run = 0; run < 5; ++run) {   // 3, 4: fp16 and int8 on the tensor cores
+                const basalt::kernels::KvInt8 kv = (run == 1 || run == 2 || run == 4) ? b8 : basalt::kernels::KvInt8{};
                 float* scr = run == 2 ? bs : nullptr;
+                basalt::kernels::gqa_set_prompt_wmma(run >= 3 ? 1 : 2);
                 basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, kv, scr, sf);
                 cudaEventRecord(a);
                 for (int i = 0; i < 5; ++i) basalt::kernels::gqa_prompt_attn(bq, bk, bv, NH, NKV, pp, T2, bo, nullptr, kv, scr, sf);
                 cudaEventRecord(b);
                 cudaEventSynchronize(b);
                 cudaEventElapsedTime(&ms, a, b);
+                static const char* what[5] = {"fp16", "int8", "int8 split scratch", "fp16, tensor cores", "int8, tensor cores"};
                 std::printf("bench: prompt chunk 2048 rows at %lld cells, %s cache: %.2f ms (%.1f TFLOP/s)\n", (long long) cells,
-                            run == 0 ? "fp16" : run == 1 ? "int8" : "int8 split scratch", ms / 5, fl / (ms / 5) / 1e9);
+                            what[run], ms / 5, fl / (ms / 5) / 1e9);
             }
+            basalt::kernels::gqa_set_prompt_wmma(0);
             cudaFree(bs);
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
+        {   // decode on the int8 cache (the 27B's) in a 65536-cell capacity, windows of 1, 5, 8 and 16 rows at 4K to
+            // 64K cells: the time of one call (attention and merge) and the K/V bytes it reads per microsecond
+            const int64_t cap = 65536;
+            basalt::kernels::KvInt8 d8;
+            cudaMalloc(&d8.k, (size_t) cap * NKV * HD);
+            cudaMalloc(&d8.v, (size_t) cap * NKV * HD);
+            cudaMalloc(&d8.ks, (size_t) cap * NKV * HD / 64 * 2);
+            cudaMalloc(&d8.vs, (size_t) cap * NKV * HD / 64 * 2);
+            cudaMemset(d8.k, 0x11, (size_t) cap * NKV * HD);
+            cudaMemset(d8.v, 0x11, (size_t) cap * NKV * HD);
+            cudaMemset(d8.ks, 0x20, (size_t) cap * NKV * HD / 64 * 2);
+            cudaMemset(d8.vs, 0x20, (size_t) cap * NKV * HD / 64 * 2);
+            float* dq = dev<float>((size_t) 16 * NH * HD);
+            float* dout = dev<float>((size_t) 16 * NH * HD);
+            float* dscr = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, 16, NH));
+            cudaMemset(dq, 0x3C, (size_t) 16 * NH * HD * 4);
+            for (const int64_t cells : {4096, 16384, 32768, 65536 - 16}) {
+                std::printf("bench: decode int8 cache, %lld cells:", (long long) cells);
+                for (const int T : {1, 5, 8, 16}) {
+                    const int64_t p0 = cells - T;
+                    for (int i = 0; i < 3; ++i)
+                        basalt::kernels::gqa_decode_attn(dq, nullptr, nullptr, NH, NKV, p0, T, dscr, cap, dout, nullptr, nullptr, d8);
+                    cudaEventRecord(a);
+                    for (int i = 0; i < 20; ++i)
+                        basalt::kernels::gqa_decode_attn(dq, nullptr, nullptr, NH, NKV, p0, T, dscr, cap, dout, nullptr, nullptr, d8);
+                    cudaEventRecord(b);
+                    cudaEventSynchronize(b);
+                    cudaEventElapsedTime(&ms, a, b);
+                    const double us = 1000.0 * ms / 20, by = (double) cells * NKV * HD * 2 * (1.0 + 2.0 / 64);
+                    std::printf("  %d rows %.1f us (%.0f GB/s)", T, us, by / us / 1e3);
+                }
+                std::printf("\n");
+            }
+            cudaFree(dq); cudaFree(dout); cudaFree(dscr);
+            cudaFree(d8.k); cudaFree(d8.v); cudaFree(d8.ks); cudaFree(d8.vs);
+        }
     }
+    basalt::kernels::gqa_set_prompt_wmma(0);
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

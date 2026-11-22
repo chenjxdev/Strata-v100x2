@@ -51,6 +51,9 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 void gqa_set_decode_variant(int v);
 /// Whether this card's WMMA accumulator layout is the one the one-pass decode rescales by (the parity test checks it).
 bool gqa_wmma_layout_ok();
+/// (V100) The prompt kernel on the tensor cores (prompt_wmma_kernel, both caches; the default): 1 = on, 2 = off (the int8
+/// or fp16 kernel), 0 = as BASALT_ATTN_PROMPT says (i8: off; unset: on).  For the parity test.
+void gqa_set_prompt_wmma(int v);
 /// `pos_dev` (optional): pos0 read from the device instead, the grid sized for `max_cells` (a captured window).
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,

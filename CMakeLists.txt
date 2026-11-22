@@ -762,6 +762,10 @@ add_executable(dense_mmvq_bench tests/kernels/dense_mmvq_bench.cpp tests/kernels
 target_link_libraries(dense_mmvq_bench PRIVATE kernels mmq ${_gpu_runtime_target})
 add_executable(dense_forward_bench tests/kernels/dense_forward_bench.cpp tests/kernels/dense_bw_probe.cu)
 target_link_libraries(dense_forward_bench PRIVATE kernels ${_gpu_runtime_target})
+# (Lapilli, V100) the NVFP4 prompt products on the tensor cores against their dp4a path, bitwise, on MMQ's own tiles
+add_executable(mmq_hmma_tile_test tests/kernels/mmq_hmma_tile_test.cu)
+target_link_libraries(mmq_hmma_tile_test PRIVATE mmq ${_gpu_runtime_target})
+target_compile_options(mmq_hmma_tile_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
 add_executable(dense_fused_parity tests/kernels/dense_fused_parity.cpp)
 target_link_libraries(dense_fused_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_fused_parity COMMAND dense_fused_parity)
