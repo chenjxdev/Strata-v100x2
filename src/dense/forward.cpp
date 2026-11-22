@@ -82,10 +82,26 @@ bool mmvq_split_on() {
     }();
     return on;
 }
+// (Lapilli, V100) BASALT_DENSE_MMVQ_VARIANT (read once; unset or 0: dense_mmvq's measured table):
+// one variant at every width, 21 = the tensor cores (fp16, not the same bits: the quality gate runs through it this way).
+// BASALT_DENSE_MMA (read once; default 0: one arithmetic at every width): 1 sends the widths where they win (5 rows and
+// more) to the tensor cores: the fastest (struct 246 against 179 j/s), but a row's result then depends on its window's
+// width, and the greedy text on the drafter's choices (measured: it changed from one run to the next).
+void dense_variant_once() {
+    static const bool done = [] {
+        const char* e = std::getenv("BASALT_DENSE_MMVQ_VARIANT");
+        if (e && *e) kernels::dense_mmvq_set_rows_per_warp(std::atoi(e));
+        const char* m = std::getenv("BASALT_DENSE_MMA");
+        if (m && *m == '1') kernels::dense_mmvq_set_tensor_cores(true);
+        return true;
+    }();
+    (void) done;
+}
 // where a decode window's product of `type` with `cols` inputs runs: wact and mmq_run ask with the same three (the layout
 // of dense_mmvq is the window's, T rows a chunk)
 enum class Route { Mmq, Iq, Dense };
 Route route(int type, int64_t cols, int T) {
+    dense_variant_once();
     if (!(type == kTypeNvfp4 || type == kTypeQ8_0) || T > mmvq_rows() || fp4_hardware()) return Route::Mmq;
     if (!mmvq_split_on() || cols % kernels::kDenseChunk != 0 || T > kernels::kDenseMaxRows) return Route::Iq;
     return kernels::dense_mmvq_faster(type, T) ? Route::Dense : Route::Mmq;

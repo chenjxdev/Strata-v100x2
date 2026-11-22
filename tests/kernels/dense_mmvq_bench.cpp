@@ -27,6 +27,10 @@ void dense_mmvq_set_rows_per_warp(int r);
 namespace basalt::kernels::probe {   // tests/kernels/dense_bw_probe.cu: the bytes read without the products
 double stream_us(const void* w, size_t bytes, void* stream);
 double nvfp4_pattern_us(const void* w, int n_in, int n_out, int rows_per_warp, void* stream);
+bool mma884_layout_check();
+bool nvfp4_decode_check();
+void wmma_acc_layout_print();
+double rows_pattern_us(const void* w, int type, int n_in, int n_out, int qs, void* stream);
 }
 
 int main(int argc, char** argv) {
@@ -35,6 +39,9 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, 0);
     std::printf("device 0: %s, %d SMs\n", prop.name, prop.multiProcessorCount);
+    if (argc == 2 && std::strcmp(argv[1], "--wmma-layout") == 0) { k::probe::wmma_acc_layout_print(); return 0; }
+    if (prop.major == 7 && !k::probe::mma884_layout_check()) return 1;   // the tensor-core variant's fragments
+    if (!k::probe::nvfp4_decode_check()) return 1;                        // and its decoding
     std::mt19937 rng(3);
     struct Shape { int type; int rows, cols; const char* name; };
     const Shape shapes[] = {{40, 17408, 5120, "NVFP4 gate/up 17408x5120"}, {40, 5120, 17408, "NVFP4 down 5120x17408"},
@@ -129,20 +136,50 @@ int main(int argc, char** argv) {
                             wb / k::probe::nvfp4_pattern_us(d_w, sh.cols, sh.rows, 4, st) / 1e3);
             else
                 std::printf("   read only: 16-byte stream %.0f GB/s\n", wb / ts / 1e3);
+            std::printf("   read only, the tensor-core variant's rows (QS 1 / 2 / 4): %.0f / %.0f / %.0f GB/s\n",
+                        wb / k::probe::rows_pattern_us(d_w, sh.type, sh.cols, sh.rows, 1, st) / 1e3,
+                        wb / k::probe::rows_pattern_us(d_w, sh.type, sh.cols, sh.rows, 2, st) / 1e3,
+                        wb / k::probe::rows_pattern_us(d_w, sh.type, sh.cols, sh.rows, 4, st) / 1e3);
         }
-        std::printf("   T   iq_mmvq |  v0 R1   v0 R2   v0 R4 |   R1      R2      R4   |  S R1   S R2   S R4  |   mmq   | best GB/s | bitwise\n");
+        std::printf("   T   iq_mmvq |  v0 R1   v0 R2   v0 R4 |   R1      R2      R4   |  S R1   S R2   S R4  |  HMMA (rel err) |  HMMA3 (rel err) |   mmq   | best GB/s | bitwise\n");
         std::vector<float> yo(ny), yn(ny);
         for (int T : widths) {
             const double to = time([&] { k::iq_mmvq(sh.type, d_w, d_xq, d_yo, sh.cols, sh.rows, T, st); });
-            double tn[15] = {};
-            const char* same[15] = {};
+            double tn[23] = {};
+            const char* same[23] = {};
+            double hmma_err = 0, hmma_err22 = 0;
             cudaMemcpy(yo.data(), d_yo, (size_t) T * sh.rows * 4, cudaMemcpyDeviceToHost);
             k::dense_quantize_q8(d_x, T, sh.cols, d_xs, st);   // the layout is the window's (T rows a chunk)
-            for (int r : {1, 2, 4, 11, 12, 14}) {
+            for (int r : {1, 2, 4, 11, 12, 14, 21, 22}) {
                 k::dense_mmvq_set_rows_per_warp(r);
                 cudaMemset(d_yn, 0xFF, ny * 4);
                 tn[r] = time([&] { k::dense_mmvq(sh.type, d_w, d_xs, d_yn, sh.cols, sh.rows, T, st); });
                 cudaMemcpy(yn.data(), d_yn, (size_t) T * sh.rows * 4, cudaMemcpyDeviceToHost);
+                if (r >= 21) {   // the tensor cores: another rounding, the error against iq_mmvq relative to its largest value
+                    double mx = 0, me = 0;
+                    for (size_t i = 0; i < (size_t) T * sh.rows; ++i) {
+                        mx = std::max(mx, (double) std::fabs(yo[i]));
+                        me = std::max(me, (double) std::fabs(yn[i] - yo[i]));
+                    }
+                    const double er = mx > 0 ? me / mx : me;
+                    (r == 21 ? hmma_err : hmma_err22) = er;
+                    {   // run to run: the same bits (no race in the staging)
+                        std::vector<float> y2((size_t) T * sh.rows);
+                        cudaMemset(d_yn, 0xFF, ny * 4);
+                        k::dense_mmvq(sh.type, d_w, d_xs, d_yn, sh.cols, sh.rows, T, st);
+                        cudaMemcpy(y2.data(), d_yn, (size_t) T * sh.rows * 4, cudaMemcpyDeviceToHost);
+                        if (std::memcmp(y2.data(), yn.data(), y2.size() * 4) != 0) {
+                            ++bad;
+                            std::printf("   T=%d variant %d: NOT the same bits from one run to the next\n", T, r);
+                        }
+                    }
+                    same[r] = "bitwise";   // not compared bit for bit: within 1e-3 of the largest value
+                    if (!(er < 1e-3)) {
+                        ++bad;
+                        std::printf("   T=%d variant %d: error %.3g of the largest value\n", T, r, er);
+                    }
+                    continue;
+                }
                 long diff = 0, first = -1;
                 for (size_t i = 0; i < (size_t) T * sh.rows; ++i)
                     if (std::memcmp(&yo[i], &yn[i], 4) != 0) { if (first < 0) first = (long) i; ++diff; }
@@ -164,9 +201,23 @@ int main(int argc, char** argv) {
             const double best = std::min({tn[1], tn[2], tn[4], tn[11], tn[12], tn[14]});
             bool all = true;
             for (int r : {1, 2, 4, 11, 12, 14}) all = all && std::strcmp(same[r], "bitwise") == 0;
-            std::printf("  %2d %8.1f | %7.1f %7.1f %7.1f | %7.1f %7.1f %7.1f | %6.1f %6.1f %6.1f | %7.1f | %6.0f | %s\n", T, to,
-                        t0[1], t0[2], t0[4], tn[1], tn[2], tn[4], tn[11], tn[12], tn[14], tm, wb / best / 1e3,
-                        all ? "all bitwise" : "DIFFERS");
+            std::printf("  %2d %8.1f | %7.1f %7.1f %7.1f | %7.1f %7.1f %7.1f | %6.1f %6.1f %6.1f | %6.1f (%.1e) | %6.1f (%.1e) | %7.1f | %6.0f | %s\n",
+                        T, to, t0[1], t0[2], t0[4], tn[1], tn[2], tn[4], tn[11], tn[12], tn[14], tn[21], hmma_err, tn[22], hmma_err22, tm,
+                        wb / best / 1e3, all ? "all bitwise" : "DIFFERS");
+        }
+        // variant 21's split (quad pairs sharing 8 rows): us per call for 1, 2, 4, then the automatic choice
+        std::printf("   tensor cores by split  T:  QS 1    QS 2    QS 4   (auto)\n");
+        for (int T : {1, 4, 8, 12, 16}) {
+            k::dense_quantize_q8(d_x, T, sh.cols, d_xs, st);
+            k::dense_mmvq_set_rows_per_warp(21);
+            double tq[5] = {};
+            for (int q : {1, 2, 4, 0}) {
+                k::dense_mmvq_set_mma_split(q);
+                tq[q] = time([&] { k::dense_mmvq(sh.type, d_w, d_xs, d_yn, sh.cols, sh.rows, T, st); });
+            }
+            k::dense_mmvq_set_mma_split(0);
+            k::dense_mmvq_set_rows_per_warp(0);
+            std::printf("                         %2d: %6.1f  %6.1f  %6.1f  (%6.1f)\n", T, tq[1], tq[2], tq[4], tq[0]);
         }
         cudaFree(d_w); cudaFree(d_x); cudaFree(d_xq); cudaFree(d_xs); cudaFree(d_xm8); cudaFree(d_xm16);
         cudaFree(d_yo); cudaFree(d_yn); cudaFree(d_ym); cudaFree(d_ids); cudaFree(d_b);

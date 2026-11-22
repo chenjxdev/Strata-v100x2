@@ -69,15 +69,15 @@ int main() {
         cudaEventElapsedTime(&ms, a, e);
         return ms / reps;
     };
-    const int variants[] = {1, 2, 4, 11, 12, 14};
+    const int variants[] = {1, 2, 4, 11, 12, 14, 21, 22};
     std::printf("ms per forward: the NVFP4 products (48 GDN + 16 attention layers) | the Q8_0 head\n");
-    std::printf("  T |   R1    R2    R4    S1    S2    S4 | best || head R1  R2    R4    S1    S2    S4 | best\n");
+    std::printf("  T |   R1    R2    R4    S1    S2    S4  HMMA HMMA3 | best || head R1  R2    R4    S1    S2    S4  HMMA | best\n");
     for (int T = 1; T <= MAXT; ++T) {
         k::dense_quantize_q8(xf, T, H, xh, st);
         k::dense_quantize_q8(xf, T, FF, xff, st);
         k::dense_quantize_q8(xf, T, 6144, x6, st);
-        double tn[6], th[6];
-        for (int iv = 0; iv < 6; ++iv) {
+        double tn[8], th[8];
+        for (int iv = 0; iv < 8; ++iv) {
             k::dense_mmvq_set_rows_per_warp(variants[iv]);
             auto mlp = [&] {
                 const k::DenseSeg gu[2] = {{gate.w, gate.rows, nullptr, y2}, {up.w, up.rows, nullptr, y1}};
@@ -122,10 +122,10 @@ int main() {
             }
         }, 3);
         int bn = 0, bh = 0;
-        for (int iv = 1; iv < 6; ++iv) { if (tn[iv] < tn[bn]) bn = iv; if (th[iv] < th[bh]) bh = iv; }
-        std::printf(" %2d | %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f | %-3d %5.2f (table %5.2f) || %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f | %-3d %5.2f\n", T,
-                    tn[0], tn[1], tn[2], tn[3], tn[4], tn[5], variants[bn], tn[bn], tt, th[0], th[1], th[2], th[3], th[4], th[5],
-                    variants[bh], th[bh]);
+        for (int iv = 1; iv < 8; ++iv) { if (tn[iv] < tn[bn]) bn = iv; if (th[iv] < th[bh]) bh = iv; }
+        std::printf(" %2d | %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f | %-3d %5.2f (table %5.2f) || %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f | %-3d %5.2f\n", T,
+                    tn[0], tn[1], tn[2], tn[3], tn[4], tn[5], tn[6], tn[7], variants[bn], tn[bn], tt, th[0], th[1], th[2], th[3], th[4], th[5],
+                    th[6], variants[bh], th[bh]);
     }
     const cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) { std::printf("CUDA error: %s\n", cudaGetErrorString(err)); return 1; }

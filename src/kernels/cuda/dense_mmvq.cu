@@ -8,6 +8,8 @@
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/mma884.cuh"
+#include "basalt/kernels/dense_decode.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,6 +20,7 @@
 #include "basalt/ggml/ggml_common.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include "basalt/log.hpp"
 
@@ -55,17 +58,7 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
     }
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
 }
-// NVFP4's UE4M3 sub-block scale as ggml decodes it (iq_kernels.cu's nvfp4_scale_dev: the same float for each of the 256
-// bytes), without its branches: both values computed, then selected.  Its two branches were a reconvergence region
-// (BSSY/BSYNC) per weight row and call in the loop, which ptxas does not schedule across.
-__device__ __forceinline__ float nvfp4_scale_dev(uint32_t x) {
-    const uint32_t v = x & 0x7F;
-    const uint32_t e = v >> 3, m = v & 7;
-    const float sub = (float) m * (1.0f / 1024.0f);
-    const float nor = __uint_as_float(((e + 119) << 23) | (m << 20));
-    const float r = e == 0 ? sub : nor;
-    return v == 0 || v == 0x7F ? 0.0f : r;
-}
+// nvfp4_scale_dev: dense_decode.cuh
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -425,15 +418,35 @@ int g_rows_per_warp = 0;
 constexpr signed char kRows[2][kDenseMaxRows + 1] = {
     {0, 11, 12, 12, 12, 14, 12, 14, 14, 14, 14, 14, 12, 14, 14, 14, 14},   // NVFP4
     {0, 11, 12, 12, 12, 12, 12, 14, 14, 4, 14, 14, 14, 4, 4, 14, 4}};       // Q8_0
-int table_rows(int t, int ncols) {
+int table_dp4a(int t, int ncols) {
     const int v = ncols >= 1 && ncols <= kDenseMaxRows ? kRows[t == kNvfp4 ? 0 : 1][ncols] : 1;
     return v < 0 ? -v : v;
+}
+// (dense_forward_bench: a whole forward's NVFP4 products as forward.cpp launches them, ms) the widths
+// where variant 21, the tensor cores, beats the table above: NVFP4 from 5 rows (5: 23.34 against 24.08; 8: 23.88 against
+// 29.04; 12: 30.26 against 39.97; 16: 31.35 against 50.57), Q8_0 at 15 and 16 (the head: 2.73 against 2.73, 2.74 against
+// 2.87; dense_mmvq_bench's Q8_0 shapes at 16: 117.8 against 128.6 and 76.3 against 77.9 us).  Not the same bits as the
+// table's dp4a variants (fp16: ~2e-4 of the largest value).  OFF by default (one arithmetic at
+// every width): with the dp4a variants alone a row's result is the same at every width (the drafter changes
+// the speed, never the answer: the same text with and without it), the arithmetic is the one checked bit for bit against
+// iq_mmvq, and an int8 activation cannot overflow (fp16 tops at 65504: no guard yet).  Mixing the two made the greedy text
+// change from one run to the next (the drafter picks its widths from measured times).  dense_mmvq_set_tensor_cores(true):
+// the widths below go to the tensor cores.
+constexpr bool kMma[2][kDenseMaxRows + 1] = {
+    {false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true},       // NVFP4
+    {false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, true}};   // Q8_0
+bool g_mma_on = false;
+// (then variant 22, NVFP4's warp-wide weight reads: 5 rows 21.84, 8 rows 22.47, 12 rows 26.45, 16 rows 27.38 ms; 4 rows
+// 21.49 against the table's 21.62, left to dp4a): NVFP4 goes to 22, Q8_0 to 21.
+int table_rows(int t, int ncols) {
+    if (g_mma_on && ncols >= 1 && ncols <= kDenseMaxRows && kMma[t == kNvfp4 ? 0 : 1][ncols]) return t == kNvfp4 ? 22 : 21;
+    return table_dp4a(t, ncols);
 }
 // the variant for a call of `ncols` columns (the same bits whichever): 1, 2, 4 weight rows a warp on the direct kernel,
 // 11, 12, 14 on the staged one
 int rows_per_warp(int t, int ncols) {
     const int v = g_rows_per_warp;
-    if (v == 1 || v == 2 || v == 4 || v == 11 || v == 12 || v == 14) return v;
+    if (v == 1 || v == 2 || v == 4 || v == 11 || v == 12 || v == 14 || v == 21 || v == 22) return v;
     return table_rows(t, ncols);
 }
 
@@ -466,10 +479,421 @@ void by_rows(int nc, int r, const Segs& sg, size_t rb, const uint8_t* x, int n_i
         default: by_width<TY, 1, EPI, false>(nc, sg, rb, x, n_in, s); break;
     }
 }
+// ---------------------------------------------------------------- wide windows on Volta's tensor cores
+// dense_mmvq's products cost a dp4a chain per (row, column, call): at 16 columns a layer's NVFP4 products took ~2.5x
+// their bytes' time.  Variant 21 runs them on HMMA (mma884.cuh: m8n8k4, fp16 in, fp32 accumulate).  A lane holds ONE
+// weight row (A .row: 4 consecutive values a k-step), decoded in registers: NVFP4 code x sub-block scale, EXACT in fp16
+// for each of the 4096 code x scale-byte pairs (the code's fp16 high byte from a 16-byte table, PRMT), Q8_0 q x d rounded
+// to fp16; the window's columns (8 a tile, one or two tiles) come from shared memory, where the block stages each chunk
+// of 512 activations as fp16 (dense_quantize_q8's int8 x its scale, rounded), one chunk ahead.  A quad pair = 8 rows x 8
+// columns; QS quad pairs share their rows and split each chunk's values (QS = 1: 32 rows a warp, 2: 16, 4: 8, chosen
+// from the launch's rows so that a small matrix still fills the card), summed by shuffles at the end, in a fixed order.
+// Another rounding than dense_mmvq (fp16 activations, the tensor cores' sums; ~2e-4 of the largest value at the 27B's
+// shapes): dense_mmvq_bench reports its error instead of a bitwise check, and the quality gate runs through it.  The
+// first version (WMMA 16x16x16, weights through shared memory, commit 3d68a178) was 2.5 to 4 times slower than
+// dense_mmvq: each warp waited for its loads, then its decode, then its products.
+// (the decoding: dense_decode.cuh)
+constexpr int kMmaWarps = 8;
+template<int QS, int NT> struct MmaShape {
+    static constexpr int RW = 32 / QS;              // weight rows a warp
+    static constexpr int ROWS = kMmaWarps * RW;     // a block
+    static constexpr int KQC = 128 / QS;            // k-quads (4 values) of a chunk per class
+    static constexpr int NG = 4 / QS;               // 128-value groups of a chunk per class
+    // a chunk's activations: [k-quad][tile][8 columns][4 halves].  An 8-byte shared load or store runs as two half warps
+    // (nvprof: 4 transactions a request before these pads): one tile, 64 bytes more every 4 k-quads (a staging half warp
+    // writes rows kq and kq + 4: on the two halves of the banks); QS > 1, 128 / QS more per class (a half warp's QS
+    // classes then read QS distinct quarters or halves of the banks)
+    static constexpr int PADQ = NT == 1 ? 64 : 0, PADC = QS > 1 ? 128 / QS : 0;
+    static constexpr int BUF = 128 * NT * 64 + 32 * PADQ + (QS - 1) * PADC;
+    __host__ __device__ static constexpr int off(int kq, int t, int col) {
+        return kq * (NT * 64) + (kq >> 2) * PADQ + (kq / KQC) * PADC + t * 64 + col * 8;
+    }
+};
+// a lane's 128 weight values: GW 8-byte loads (GB bytes) at offset (group) GB of its class in each chunk of CB bytes
+template<int TY> struct MmaW;
+template<> struct MmaW<kNvfp4> { static constexpr int GW = 9, GB = 72, CB = 288; };    // 2 blocks of 36 bytes
+template<> struct MmaW<kQ8_0> { static constexpr int GW = 17, GB = 136, CB = 544; };   // 4 blocks of 34 bytes
+template<int GW>
+__device__ __forceinline__ void mma_load(const uint8_t* p, uint2 (&g)[GW]) {
+#pragma unroll
+    for (int i = 0; i < GW; ++i) g[i] = __ldg(reinterpret_cast<const uint2*>(p) + i);
+}
+template<int GW>
+__device__ __forceinline__ uint32_t mma_word(const uint2 (&g)[GW], int k) { return (k & 1) ? g[k >> 1].y : g[k >> 1].x; }
+
+// one k-quad (4 values) against the window's tiles: the lane's A fragment, its B column from the staged chunk
+template<int NT>
+__device__ __forceinline__ void mma_kq(const uint8_t* bq, unsigned a0, unsigned a1, float (&acc)[NT][8]) {
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const uint2 b = *reinterpret_cast<const uint2*>(bq + t * 64);
+        mma884(acc[t], a0, a1, b.x, b.y);
+    }
+}
+// a lane's 128 values (32 k-quads in order), bg: its B column at the group's first k-quad
+template<int TY, int QS, int NT>
+__device__ __forceinline__ void mma_group(const uint2 (&g)[MmaW<TY>::GW], const uint8_t* bg, float (&acc)[NT][8]) {
+    using Sh = MmaShape<QS, NT>;
+    auto at = [&](int dk) { return bg + dk * (NT * 64) + (dk >> 2) * Sh::PADQ; };   // the group starts at a multiple of 4
+    if constexpr (TY == kNvfp4) {   // 2 blocks: word 9 b = the 4 sub-block scales, words 9 b + 1 + 2 s + w the codes
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const uint32_t sw = mma_word(g, 9 * b);
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const unsigned s2 = nvfp4_scale_h2(sw >> (8 * s));
+#pragma unroll
+                for (int w = 0; w < 2; ++w) {   // values 4 w .. 4 w + 3 (low nibbles) and 8 + 4 w .. (high nibbles)
+                    unsigned lo[2], hi[2];
+                    fp4_frags(mma_word(g, 9 * b + 1 + 2 * s + w), s2, lo, hi);
+                    const int kq = 16 * b + 4 * s + w;
+                    mma_kq<NT>(at(kq), lo[0], lo[1], acc);
+                    mma_kq<NT>(at(kq + 2), hi[0], hi[1], acc);
+                }
+            }
+        }
+    } else {   // 4 blocks of 34 bytes: d, then 32 int8; block i's words start 2 bytes off a word when i is even
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int b0 = 34 * i;
+            const uint32_t dw = mma_word(g, b0 / 4);
+            const __half d = __ushort_as_half((unsigned short) (b0 % 4 == 0 ? dw & 0xFFFF : dw >> 16));
+            const __half2 d2 = __halves2half2(d, d);
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                const int s0 = b0 + 2 + 4 * m;
+                const uint32_t q = s0 % 4 == 0 ? mma_word(g, s0 / 4)
+                                                : __byte_perm(mma_word(g, s0 / 4), mma_word(g, s0 / 4 + 1), 0x5432);
+                __half2 h0, h1;
+                i8x4_to_half(q, h0, h1);
+                mma_kq<NT>(at(8 * i + m), h2_bits(__hmul2(h0, d2)), h2_bits(__hmul2(h1, d2)), acc);
+            }
+        }
+    }
+}
+
+template<int TY, int QS, int NT, int EPI>
+__global__ void __launch_bounds__(kMmaWarps * 32, 2) dense_mma_kernel(const Segs sg, size_t row_bytes,
+                                                                    const uint8_t* __restrict__ x, int n_in, int ncols) {
+    using Sh = MmaShape<QS, NT>;
+    using Wf = MmaW<TY>;
+    __shared__ __align__(16) uint8_t bsm[2][Sh::BUF];
+    int seg = 0;
+#pragma unroll
+    for (int i = 1; i < kDenseMaxSegs; ++i)
+        if (i < sg.n && (int) blockIdx.x >= sg.first[i]) seg = i;
+    const int n_out = sg.rows[seg];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int qp = (lane >> 2) & 3, rs = qp / QS, kc = qp % QS, ab = mma884_ab_index(lane);
+    const int row0 = ((int) blockIdx.x - sg.first[seg]) * Sh::ROWS + warp * Sh::RW + rs * 8;   // the quad pair's 8 rows
+    const uint8_t* __restrict__ wrow = sg.w[seg] + (size_t) min(row0 + ab, n_out - 1) * row_bytes + kc * Sh::NG * Wf::GB;
+    const int chunks = n_in / kDenseChunk, groups = chunks * Sh::NG;
+    auto gaddr = [&](int n) { return wrow + (size_t) (n / Sh::NG) * Wf::CB + (n % Sh::NG) * Wf::GB; };
+    // the staging of a chunk: thread tid takes column sc and values [VPT sp, +VPT) (16 or 32: within one q8 block)
+    constexpr int CPB = NT * 8, VPT = 4096 * NT / (kMmaWarps * 32), XW = VPT / 16;
+    const int sc = tid % CPB, sp = tid / CPB;
+    const bool live = sc < ncols;   // a column past the window reads the last one and stores zeros (its scale 0): no branch
+    const uint8_t* xcol = x + (size_t) min(sc, ncols - 1) * kChunkBytes + sp * VPT;
+    int4 xq[XW];
+    unsigned short xd = 0;
+    auto fetch = [&](int j) {
+        const uint8_t* xc = xcol + (size_t) j * ncols * kChunkBytes;
+#pragma unroll
+        for (int i = 0; i < XW; ++i) xq[i] = __ldg(reinterpret_cast<const int4*>(xc) + i);
+        xd = __ldg(reinterpret_cast<const unsigned short*>(xc - sp * VPT + kDenseChunk) + sp * VPT / 32);
+    };
+    auto commit = [&](uint8_t* buf) {
+        const __half d = __ushort_as_half(live ? xd : (unsigned short) 0);
+        const __half2 d2 = __halves2half2(d, d);
+#pragma unroll
+        for (int i = 0; i < VPT / 4; ++i) {
+            const int4 q = xq[i / 4];
+            __half2 h0, h1;
+            i8x4_to_half((unsigned) ((i & 3) == 0 ? q.x : (i & 3) == 1 ? q.y : (i & 3) == 2 ? q.z : q.w), h0, h1);
+            *reinterpret_cast<uint2*>(buf + Sh::off(sp * (VPT / 4) + i, sc / 8, sc % 8)) =
+                make_uint2(h2_bits(__hmul2(h0, d2)), h2_bits(__hmul2(h1, d2)));
+        }
+    };
+    float acc[NT][8];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[t][i] = 0.0f;
+    uint2 ga[Wf::GW], gb[Wf::GW];
+    mma_load(gaddr(0), ga);   // weights before the wait: they do not depend on the previous launch
+    pdl_wait();
+    fetch(0);
+    commit(bsm[0]);
+    const int bcol = Sh::off(kc * Sh::KQC, 0, ab);   // the lane's B column at its class's first k-quad
+    // group n of the lane (chunk n / NG): the chunk's B was staged one chunk ahead; cur holds n, n + 1 loads into nxt.
+    // No branch: the last group and chunk load themselves again, the last commit fills the buffer no one reads any more.
+    auto step = [&](int n, uint2 (&cur)[Wf::GW], uint2 (&nxt)[Wf::GW]) {
+        const int j = n / Sh::NG, g = n % Sh::NG;
+        if (g == 0) {
+            __syncthreads();   // chunk j staged; every warp is done with the other buffer
+            fetch(min(j + 1, chunks - 1));
+        }
+        mma_load(gaddr(min(n + 1, groups - 1)), nxt);
+        mma_group<TY, QS, NT>(cur, bsm[j & 1] + bcol + Sh::off(32 * g, 0, 0), acc);
+        if (g == Sh::NG - 1) commit(bsm[(j + 1) & 1]);
+    };
+#pragma unroll 1
+    for (int n = 0; n < groups; n += 2) {
+        step(n, ga, gb);
+        if (n + 1 < groups) step(n + 1, gb, ga);
+    }
+    // the classes of a quad-pair group hold partial sums of the same cells: xor 4 (QS 2), then 8 (QS 4)
+    if constexpr (QS > 1) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc[t][i] += __shfl_xor_sync(0xffffffffu, acc[t][i], 4);
+                if constexpr (QS == 4) acc[t][i] += __shfl_xor_sync(0xffffffffu, acc[t][i], 8);
+            }
+    }
+    if (kc != 0) return;
+    const float* sc_ = sg.scale[seg];
+    float* y = sg.y[seg];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = row0 + mma884_c_row(lane, i), col = 8 * t + mma884_c_col(lane, i);
+            if (row >= n_out || col >= ncols) continue;
+            const size_t o = (size_t) col * n_out + row;
+            const float v = sc_ ? __fmul_rn(acc[t][i], *sc_) : acc[t][i];
+            if constexpr (EPI == EPI_STORE) y[o] = v;
+            else sg.resid[o] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(sg.resid[o]), v));
+        }
+}
+int g_mma_qs = 0;   // 0: chosen from the launch's rows
+template<int TY, int QS, int NT, int EPI>
+void go_mma(Segs sg, size_t rb, const uint8_t* x, int n_in, int ncols, cudaStream_t s) {
+    constexpr int rows = MmaShape<QS, NT>::ROWS;
+    for (int i = 0; i < sg.n; ++i) sg.first[i + 1] = sg.first[i] + (sg.rows[i] + rows - 1) / rows;
+    launch_pdl(dense_mma_kernel<TY, QS, NT, EPI>, dim3((unsigned) sg.first[sg.n]), dim3(kMmaWarps * 32), 0, s, sg, rb, x, n_in,
+               ncols);
+}
+template<int TY, int NT, int EPI>
+void mma_by_split(int qs, const Segs& sg, size_t rb, const uint8_t* x, int n_in, int ncols, cudaStream_t s) {
+    if (qs == 1) go_mma<TY, 1, NT, EPI>(sg, rb, x, n_in, ncols, s);
+    else if (qs == 2) go_mma<TY, 2, NT, EPI>(sg, rb, x, n_in, ncols, s);
+    else go_mma<TY, 4, NT, EPI>(sg, rb, x, n_in, ncols, s);
+}
+// whether variant 21 can take the launch: 8-byte aligned matrices (its loads), then the split for its rows: at least
+// ~1000 warps when it can (the card holds 16 a SM)
+bool mma_ok(const Segs& sg) {
+    for (int i = 0; i < sg.n; ++i)
+        if (reinterpret_cast<uintptr_t>(sg.w[i]) % 8 != 0) return false;
+    return true;
+}
+template<int TY, int EPI>
+void launch_mma(const Segs& sg, size_t rb, const uint8_t* x, int n_in, int ncols, cudaStream_t s) {
+    int rows = 0;
+    for (int i = 0; i < sg.n; ++i) rows += sg.rows[i];
+    // QS 4 by default: the weight reads alone (dense_mmvq_bench's probe) reach 700-770 GB/s with 8 rows a warp, 240-570 with
+    // 32 (each load then spans 32 rows), and the split sweep at the 27B's shapes agrees
+    (void) rows;
+    const int qs = g_mma_qs == 1 || g_mma_qs == 2 || g_mma_qs == 4 ? g_mma_qs : 4;
+    if (ncols <= 8) mma_by_split<TY, 1, EPI>(qs, sg, rb, x, n_in, ncols, s);
+    else mma_by_split<TY, 2, EPI>(qs, sg, rb, x, n_in, ncols, s);
+}
+
+// ---------------------------------------------------------------- variant 22: NVFP4, a warp's weights read whole
+// nvprof on variant 21 (gate/up, 8 rows): each 8-byte weight load touched 28 to 30 sectors (8 rows x 4 pieces 72 bytes
+// apart), 31 % of the stalls waited for data and 13 % on the memory pipe.  Here a warp loads its 8 rows' chunk (8 x 288
+// bytes) as consecutive 8-byte pieces (a load: 256 bytes of at most two rows) and hands them over through shared memory to
+// the lanes that decode them (each lane its row's 72 bytes, as in variant 21; neither the stores nor the loads conflict).
+// And a sub-block's values pair as get_int_from_table_16 leaves them before its last two byte permutes: (0, 8), (1, 9) ...
+// (fp4_frags_paired); the staged activations follow that order (act_pairs).  QS 4 (8 rows a warp, the 4 quad pairs one
+// class of the chunk each).  One tile: the activations double-buffered (one barrier a chunk); two: single (two barriers).
+template<int NT> struct Mma3Shape {
+    static constexpr int ROWS = kMmaWarps * 8, KQC = 32;
+    static constexpr int PADQ = NT == 1 ? 64 : 0, PADC = 32;
+    static constexpr int BUF = 128 * NT * 64 + 32 * PADQ + 3 * PADC;
+    static constexpr bool DB = NT == 1;
+    static constexpr int WB = 8 * 288;   // a warp's 8 rows of a chunk
+    __host__ __device__ static constexpr int off(int kq, int t, int col) {
+        return kq * (NT * 64) + (kq >> 2) * PADQ + (kq / KQC) * PADC + t * 64 + col * 8;
+    }
+};
+template<int NT>
+__device__ __forceinline__ void mma3_group(const uint2 (&g)[9], const uint8_t* bg, float (&acc)[NT][8]) {
+    using Sh = Mma3Shape<NT>;
+    auto at = [&](int dk) { return bg + dk * (NT * 64) + (dk >> 2) * Sh::PADQ; };
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const uint32_t sw = mma_word(g, 9 * b);
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const unsigned s2 = nvfp4_scale_h2(sw >> (8 * s));
+#pragma unroll
+            for (int w = 0; w < 2; ++w) {
+                unsigned q0[2], q1[2];
+                fp4_frags_paired(mma_word(g, 9 * b + 1 + 2 * s + w), s2, q0, q1);
+                const int kq = 16 * b + 4 * s + 2 * w;
+                mma_kq<NT>(at(kq), q0[0], q0[1], acc);
+                mma_kq<NT>(at(kq + 1), q1[0], q1[1], acc);
+            }
+        }
+    }
+}
+template<int NT, int EPI>
+__global__ void __launch_bounds__(kMmaWarps * 32, 2) dense_mma3_kernel(const Segs sg, size_t row_bytes,
+                                                                     const uint8_t* __restrict__ x, int n_in, int ncols) {
+    using Sh = Mma3Shape<NT>;
+    __shared__ __align__(16) uint8_t bsm[Sh::DB ? 2 : 1][Sh::BUF];
+    __shared__ __align__(16) uint8_t wsm[kMmaWarps][Sh::WB];
+    int seg = 0;
+#pragma unroll
+    for (int i = 1; i < kDenseMaxSegs; ++i)
+        if (i < sg.n && (int) blockIdx.x >= sg.first[i]) seg = i;
+    const int n_out = sg.rows[seg];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int kc = (lane >> 2) & 3, ab = mma884_ab_index(lane);
+    const int row0 = ((int) blockIdx.x - sg.first[seg]) * Sh::ROWS + warp * 8;
+    // the warp's pieces: piece p = 32 i + lane of its rows' chunk, row p / 36, bytes 8 (p % 36); in wsm at 8 p
+    const uint8_t* __restrict__ wbase = sg.w[seg];
+    uint32_t po[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        const int p = 32 * i + lane, r = p / 36;
+        po[i] = (uint32_t) min(row0 + r, n_out - 1) * (uint32_t) row_bytes + 8u * (uint32_t) (p - 36 * r);
+    }
+    uint8_t* const wmine = wsm[warp];
+    const uint8_t* const wlane = wmine + ab * 288 + 72 * kc;   // the lane's 72 bytes (2 blocks of its row)
+    const int chunks = n_in / kDenseChunk;
+    auto wload = [&](int j, uint2 (&raw)[9]) {
+        const uint8_t* c = wbase + (size_t) j * 288;
+#pragma unroll
+        for (int i = 0; i < 9; ++i) raw[i] = __ldg(reinterpret_cast<const uint2*>(c + po[i]));
+    };
+    auto wpass = [&](const uint2 (&raw)[9], uint2 (&cur)[9]) {   // the warp's pieces to its lanes (after __syncwarp)
+#pragma unroll
+        for (int i = 0; i < 9; ++i) *reinterpret_cast<uint2*>(wmine + 256 * i + 8 * lane) = raw[i];
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < 9; ++i) cur[i] = *reinterpret_cast<const uint2*>(wlane + 8 * i);
+        __syncwarp();   // every lane has its pieces before the next chunk's are stored
+    };
+    // the activations' staging: thread tid takes column sc and values [VPT sp, +VPT) (one or two sub-blocks)
+    constexpr int CPB = NT * 8, VPT = 4096 * NT / (kMmaWarps * 32), XW = VPT / 16;
+    const int sc = tid % CPB, sp = tid / CPB;
+    const bool live = sc < ncols;
+    const uint8_t* xcol = x + (size_t) min(sc, ncols - 1) * kChunkBytes;
+    int4 xq[XW];
+    unsigned short xd = 0;
+    auto fetch = [&](int j) {
+        const uint8_t* xc = xcol + (size_t) j * ncols * kChunkBytes;
+#pragma unroll
+        for (int i = 0; i < XW; ++i) xq[i] = __ldg(reinterpret_cast<const int4*>(xc + sp * VPT) + i);
+        xd = __ldg(reinterpret_cast<const unsigned short*>(xc + kDenseChunk) + sp * VPT / 32);
+    };
+    auto commit = [&](uint8_t* buf) {
+        const __half d = __ushort_as_half(live ? xd : (unsigned short) 0);
+        const __half2 d2 = __halves2half2(d, d);
+#pragma unroll
+        for (int u = 0; u < XW; ++u)       // sub-block u of the thread's values
+#pragma unroll
+            for (int w = 0; w < 2; ++w) {   // its words w and w + 2: k-quads 2 w and 2 w + 1
+                const int4 q = xq[u];
+                uint32_t k0, k1;
+                act_pairs((uint32_t) (w ? q.y : q.x), (uint32_t) (w ? q.w : q.z), k0, k1);
+                __half2 h0, h1, h2, h3;
+                i8x4_to_half(k0, h0, h1);
+                i8x4_to_half(k1, h2, h3);
+                const int kq = sp * (VPT / 4) + 4 * u + 2 * w;
+                *reinterpret_cast<uint2*>(buf + Sh::off(kq, sc / 8, sc % 8)) =
+                    make_uint2(h2_bits(__hmul2(h0, d2)), h2_bits(__hmul2(h1, d2)));
+                *reinterpret_cast<uint2*>(buf + Sh::off(kq + 1, sc / 8, sc % 8)) =
+                    make_uint2(h2_bits(__hmul2(h2, d2)), h2_bits(__hmul2(h3, d2)));
+            }
+    };
+    float acc[NT][8];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[t][i] = 0.0f;
+    uint2 raw[9], cur[9];
+    wload(0, raw);   // weights before the wait: they do not depend on the previous launch
+    pdl_wait();
+    fetch(0);
+    commit(bsm[0]);
+    wpass(raw, cur);
+    __syncthreads();
+    const int bcol = Sh::off(kc * Sh::KQC, 0, ab);
+#pragma unroll 1
+    for (int j = 0; j < chunks; ++j) {
+        const int jn = min(j + 1, chunks - 1);   // the last chunk loads itself again: no branch
+        wload(jn, raw);
+        fetch(jn);
+        mma3_group<NT>(cur, bsm[Sh::DB ? (j & 1) : 0] + bcol, acc);
+        if constexpr (Sh::DB) {
+            commit(bsm[(j + 1) & 1]);
+        } else {
+            __syncthreads();   // every warp is done with chunk j's activations
+            commit(bsm[0]);
+        }
+        wpass(raw, cur);
+        __syncthreads();       // chunk j + 1's activations staged
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[t][i] += __shfl_xor_sync(0xffffffffu, acc[t][i], 4);
+            acc[t][i] += __shfl_xor_sync(0xffffffffu, acc[t][i], 8);
+        }
+    if (kc != 0) return;
+    const float* sc_ = sg.scale[seg];
+    float* y = sg.y[seg];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = row0 + mma884_c_row(lane, i), col = 8 * t + mma884_c_col(lane, i);
+            if (row >= n_out || col >= ncols) continue;
+            const size_t o = (size_t) col * n_out + row;
+            const float v = sc_ ? __fmul_rn(acc[t][i], *sc_) : acc[t][i];
+            if constexpr (EPI == EPI_STORE) y[o] = v;
+            else sg.resid[o] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(sg.resid[o]), v));
+        }
+}
+template<int NT, int EPI>
+void go_mma3(Segs sg, size_t rb, const uint8_t* x, int n_in, int ncols, cudaStream_t s) {
+    constexpr int rows = Mma3Shape<NT>::ROWS;
+    for (int i = 0; i < sg.n; ++i) sg.first[i + 1] = sg.first[i] + (sg.rows[i] + rows - 1) / rows;
+    launch_pdl(dense_mma3_kernel<NT, EPI>, dim3((unsigned) sg.first[sg.n]), dim3(kMmaWarps * 32), 0, s, sg, rb, x, n_in, ncols);
+}
+// variant 22's offsets are 32-bit: a matrix of NVFP4 rows within 4 GB
+bool mma3_ok(const Segs& sg, size_t rb) {
+    for (int i = 0; i < sg.n; ++i)
+        if ((size_t) sg.rows[i] * rb >= (size_t) 0xFFFFFFFFu) return false;
+    return mma_ok(sg);
+}
+
 template<int EPI>
 void launch_segs(int t, const Segs& sg, const void* x, int n_in, int ncols, cudaStream_t s) {
     const size_t rb = t == kNvfp4 ? (size_t) (n_in / 64) * sizeof(block_nvfp4) : (size_t) (n_in / 32) * sizeof(block_q8_0);
-    const int r = rows_per_warp(t, ncols);
+    int r = rows_per_warp(t, ncols);
+    if (r == 22 && (t != kNvfp4 || !mma3_ok(sg, rb))) r = 21;   // variant 22 is NVFP4's; Q8_0 keeps 21
+    if (r == 22) {
+        if (ncols <= 8) go_mma3<1, EPI>(sg, rb, (const uint8_t*) x, n_in, ncols, s);
+        else go_mma3<2, EPI>(sg, rb, (const uint8_t*) x, n_in, ncols, s);
+        return;
+    }
+    if (r == 21 && !mma_ok(sg)) {
+        static bool told = false;   // said once: the engine's matrices are expected aligned
+        if (!told) basalt::log::warn("basalt", "dense_mmvq: a matrix not 8-byte aligned, the dp4a variants instead of the tensor cores");
+        told = true;
+        r = table_dp4a(t, ncols);
+    }
+    if (r == 21) {   // the tensor cores
+        if (t == kNvfp4) launch_mma<kNvfp4, EPI>(sg, rb, (const uint8_t*) x, n_in, ncols, s);
+        else launch_mma<kQ8_0, EPI>(sg, rb, (const uint8_t*) x, n_in, ncols, s);
+        return;
+    }
     if (t == kNvfp4) by_rows<kNvfp4, EPI>(ncols, r, sg, rb, (const uint8_t*) x, n_in, s);
     else by_rows<kQ8_0, EPI>(ncols, r, sg, rb, (const uint8_t*) x, n_in, s);
 }
@@ -489,6 +913,8 @@ size_t dense_q8_bytes(int64_t n_cols, int64_t n_rows) noexcept {
     return (size_t) n_rows * (size_t) ((n_cols + kDenseChunk - 1) / kDenseChunk) * kChunkBytes;
 }
 void dense_mmvq_set_rows_per_warp(int r) { g_rows_per_warp = r; }
+void dense_mmvq_set_mma_split(int qs) { g_mma_qs = qs; }
+void dense_mmvq_set_tensor_cores(bool on) { g_mma_on = on; }
 
 void dense_quantize_q8(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     if (n_cols % kDenseChunk != 0) {

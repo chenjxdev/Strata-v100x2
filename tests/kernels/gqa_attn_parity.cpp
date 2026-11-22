@@ -78,6 +78,15 @@ int main(int argc, char** argv) {
         std::printf("no GPU\n");
         return 77;
     }
+    {   // the one-pass decode rescales rows by Volta's WMMA accumulator layout: is it this card's?
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+        if (major == 7) {
+            const bool ok = basalt::kernels::gqa_wmma_layout_ok();
+            std::printf("wmma accumulator layout as decode_wmma3_kernel reads it: %s\n", ok ? "yes" : "NO");
+            if (!ok) return 1;
+        }
+    }
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
     int fails = 0;
@@ -208,6 +217,28 @@ int main(int argc, char** argv) {
     std::printf("gqa_decode_attn: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-%d: %s\n", ed.abs,
                 ed.rel, TW, bitwise ? "yes" : "NO");
     if (ed.abs > 1e-3 || !bitwise) ++fails;   // fp16 q, K, V and p on the tensor cores
+    {   // the same checks for decode_884_kernel (variant 4: Volta's own instruction, warps on their own)
+        basalt::kernels::gqa_set_decode_variant(4);
+        Err e4;
+        bool bw4 = true;
+        std::vector<float> single4((size_t) NH * HD);
+        for (int T = 1; T <= TW; ++T) {
+            const int r0 = TP - T;
+            basalt::kernels::gqa_decode_attn(d_q + (size_t) r0 * NH * HD, d_kc, d_vc, NH, NKV, p0 + r0, T, d_scr, max_cells, d_out, nullptr);
+            ck(cudaMemcpy(got.data(), d_out, (size_t) T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+            const float* last = &got[(size_t) (T - 1) * NH * HD];
+            if (T == 1) std::memcpy(single4.data(), last, (size_t) NH * HD * 4);
+            else if (std::memcmp(single4.data(), last, (size_t) NH * HD * 4) != 0) bw4 = false;
+            for (int t = 0; t < T; ++t)
+                for (size_t i = 0; i < rows.size(); ++i)
+                    if (rows[i] == r0 + t)
+                        for (int j = 0; j < NH * HD; ++j) e4.add(got[(size_t) t * NH * HD + j], want[i][(size_t) j]);
+        }
+        basalt::kernels::gqa_set_decode_variant(0);
+        std::printf("variant 4: max abs %.3g rel %.3g vs double; the last row bitwise equal across widths 1-%d: %s\n", e4.abs, e4.rel,
+                    TW, bw4 ? "yes" : "NO");
+        if (e4.abs > 1e-3 || !bw4) ++fails;
+    }
     {
         // a captured window reads its first cell on the device and loops its blocks over the chunks in use: bitwise the
         // host-position launch, past the grid's first round of chunks
@@ -249,6 +280,65 @@ int main(int argc, char** argv) {
             std::printf("gqa_decode_attn_segs: windows of %d and %d rows in one launch bitwise their own launches: %s\n", TA, TB,
                         same_seg ? "yes" : "NO");
             if (!same_seg) ++fails;
+            // the second WMMA kernel against the first: the same bits, as one launch and as these segments
+            bool v_same = true;
+            for (int T : {1, 2, 3, 5, 8, 11, 16}) {
+                std::vector<float> a1((size_t) T * NH * HD), a2(a1.size());
+                basalt::kernels::gqa_set_decode_variant(1);
+                basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 16, T, d_s2, cap2, d_out, nullptr);
+                ck(cudaMemcpy(a1.data(), d_out, a1.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                basalt::kernels::gqa_set_decode_variant(2);
+                basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 16, T, d_s2, cap2, d_out, nullptr);
+                ck(cudaMemcpy(a2.data(), d_out, a2.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                if (std::memcmp(a1.data(), a2.data(), a1.size() * 4) != 0) {
+                    v_same = false;
+                    std::printf("  decode variants differ at %d rows\n", T);
+                }
+            }
+            basalt::kernels::gqa_set_decode_variant(1);
+            basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, sg, 2, d_s2, cap2, d_out, nullptr);
+            ck(cudaMemcpy(solo.data(), d_out, seg.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            basalt::kernels::gqa_set_decode_variant(2);
+            basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, sg, 2, d_s2, cap2, d_out, nullptr);
+            ck(cudaMemcpy(seg.data(), d_out, seg.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            if (std::memcmp(solo.data(), seg.data(), seg.size() * 4) != 0) {
+                v_same = false;
+                std::printf("  decode variants differ on the segments\n");
+            }
+            {   // segments of 3 and 5 rows (two tiles each: the second kernel's case)
+                basalt::kernels::GqaSeg s2[2] = {sg[0], sg[1]};
+                s2[0].T = 3;
+                s2[1].T = 5;
+                std::vector<float> b1((size_t) 8 * NH * HD), b2(b1.size());
+                for (int v : {1, 2}) {
+                    basalt::kernels::gqa_set_decode_variant(v);
+                    basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, s2, 2, d_s2, cap2, d_out, nullptr);
+                    ck(cudaMemcpy((v == 1 ? b1 : b2).data(), d_out, b1.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                }
+                if (std::memcmp(b1.data(), b2.data(), b1.size() * 4) != 0) {
+                    v_same = false;
+                    std::printf("  decode variants differ on the segments of 3 and 5 rows\n");
+                }
+            }
+            basalt::kernels::gqa_set_decode_variant(0);
+            std::printf("gqa_decode_attn: the second WMMA kernel bitwise the first (fp16 cache, 1 to 16 rows, segments): %s\n",
+                        v_same ? "yes" : "NO");
+            if (!v_same) ++fails;
+            {   // variant 4: segments of 5 and 7 rows bitwise their own launches
+                basalt::kernels::gqa_set_decode_variant(4);
+                std::vector<float> so4((size_t) (TA + TB) * NH * HD), sg4(so4.size());
+                basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, 3000, TA, d_s2, cap2, d_out, nullptr);
+                ck(cudaMemcpy(so4.data(), d_out, (size_t) TA * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+                basalt::kernels::gqa_decode_attn(d_q + (size_t) TA * NH * HD, d_k2, d_v2, NH, NKV, at - TB, TB, d_s2, cap2, d_out, nullptr);
+                ck(cudaMemcpy(so4.data() + (size_t) TA * NH * HD, d_out, (size_t) TB * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+                basalt::kernels::gqa_decode_attn_segs(d_q, NH, NKV, sg, 2, d_s2, cap2, d_out, nullptr);
+                ck(cudaMemcpy(sg4.data(), d_out, sg4.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                basalt::kernels::gqa_set_decode_variant(0);
+                const bool ok4 = std::memcmp(so4.data(), sg4.data(), sg4.size() * 4) == 0;
+                std::printf("variant 4: windows of %d and %d rows in one launch bitwise their own launches: %s\n", TA, TB,
+                            ok4 ? "yes" : "NO");
+                if (!ok4) ++fails;
+            }
             ck(cudaMemcpy(d_at, at2, sizeof at2, cudaMemcpyHostToDevice), "copy");
         }
         // its cost at a short context in a large capacity, against the host launch's grid of the chunks in use
@@ -267,13 +357,20 @@ int main(int argc, char** argv) {
         }
         std::printf("bench: decode 1 row x 3000 cells in %lld: %.1f us host first cell, %.1f us device first cell\n",
                     (long long) cap2, us[0], us[1]);
-        for (int T : {1, 8, 16}) {   // a window of T rows near 12K cells
-            for (int i = 0; i < 5; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
-            cudaDeviceSynchronize();
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < 100; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
-            cudaDeviceSynchronize();
-            std::printf("bench: decode %d rows x %lld cells: %.1f us\n", T, (long long) at, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 100);
+        for (int T : {1, 5, 8, 16}) {   // a window of T rows near 12K cells: the one-pass kernel, then the two-pass ones
+            double tv[5] = {};
+            for (int v : {4, 3, 2, 1}) {
+                basalt::kernels::gqa_set_decode_variant(v);
+                for (int i = 0; i < 5; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
+                cudaDeviceSynchronize();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 100; ++i) basalt::kernels::gqa_decode_attn(d_q, d_k2, d_v2, NH, NKV, at - 8, T, d_s2, cap2, d_out, nullptr);
+                cudaDeviceSynchronize();
+                tv[v] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 100;
+            }
+            basalt::kernels::gqa_set_decode_variant(0);
+            std::printf("bench: decode %d rows x %lld cells: %.1f us (two passes: %.1f, the first WMMA kernel %.1f; variant 4: %.1f)\n",
+                        T, (long long) at, tv[3], tv[2], tv[1], tv[4]);
         }
         cudaFree(d_k2); cudaFree(d_v2); cudaFree(d_s2); cudaFree(d_at);
     }
@@ -340,6 +437,34 @@ int main(int argc, char** argv) {
         Err e8;
         for (int j = 0; j < NH * HD; ++j) e8.add(g8[(size_t) j], w8[(size_t) j]);
         std::printf("int8 cache: decode max abs %.3g rel %.3g vs double on the dequantized cells\n", e8.abs, e8.rel);
+        {   // variant 4 on the int8 cache
+            basalt::kernels::gqa_set_decode_variant(4);
+            basalt::kernels::gqa_decode_attn(d_q + (size_t) (TP - 1) * NH * HD, nullptr, nullptr, NH, NKV, p0 + TP - 1, 1, d_scr,
+                                             max_cells, d_out, nullptr, nullptr, q8);
+            basalt::kernels::gqa_set_decode_variant(0);
+            std::vector<float> g4((size_t) NH * HD);
+            ck(cudaMemcpy(g4.data(), d_out, g4.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            Err e84;
+            for (int j = 0; j < NH * HD; ++j) e84.add(g4[(size_t) j], w8[(size_t) j]);
+            std::printf("int8 cache, variant 4: decode max abs %.3g rel %.3g vs double on the dequantized cells\n", e84.abs, e84.rel);
+            if (e84.abs > 1e-3) ++fails;
+        }
+        {   // the second WMMA kernel bitwise the first on the int8 cache, windows of 1, 6 and 16 rows
+            bool v8 = true;
+            for (int T : {1, 6, 16}) {
+                std::vector<float> a1((size_t) T * NH * HD), a2(a1.size());
+                for (int v : {1, 2}) {
+                    basalt::kernels::gqa_set_decode_variant(v);
+                    basalt::kernels::gqa_decode_attn(d_q + (size_t) (TP - T) * NH * HD, nullptr, nullptr, NH, NKV, p0 + TP - T, T,
+                                                     d_scr, max_cells, d_out, nullptr, nullptr, q8);
+                    ck(cudaMemcpy((v == 1 ? a1 : a2).data(), d_out, a1.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                }
+                if (std::memcmp(a1.data(), a2.data(), a1.size() * 4) != 0) v8 = false;
+            }
+            basalt::kernels::gqa_set_decode_variant(0);
+            std::printf("int8 cache: the second WMMA kernel bitwise the first (1, 6, 16 rows): %s\n", v8 ? "yes" : "NO");
+            if (!v8) ++fails;
+        }
         // decode reads code x scale in fp32, the reference its fp16 rounding
         if (e8.abs > 1e-3) ++fails;
 

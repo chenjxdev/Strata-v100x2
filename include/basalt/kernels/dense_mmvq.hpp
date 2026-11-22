@@ -62,7 +62,13 @@ void dense_swiglu_quantize(const float* g, const float* u, const float* sg, cons
                            void* y, void* stream);
 
 /// The variant for every width: 1, 2 or 4 weight rows a warp on the direct kernel, 11, 12 or 14 on the staged one (the
-/// activations through shared memory); 0 (the default) = the measured table.  For the bench.
+/// activations through shared memory), 21 on the tensor cores (fp16: not the same bits); 0 (the default) = the measured
+/// table.  For the bench and the engine's forced variant.
 void dense_mmvq_set_rows_per_warp(int r);
+/// Variant 21's split: 1, 2 or 4 quad pairs per 8 rows (32, 16 or 8 rows a warp); 0 (the default) = from the rows.
+void dense_mmvq_set_mma_split(int qs);
+/// Whether the table sends the widths where they win to the tensor cores (21, 22) or keeps the dp4a variants (false, the
+/// default: the same bits at every width; see dense_mmvq.cu's kMma).
+void dense_mmvq_set_tensor_cores(bool on);
 
 }  // namespace basalt::kernels
