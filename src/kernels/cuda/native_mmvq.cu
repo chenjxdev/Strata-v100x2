@@ -1204,17 +1204,21 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 }
 
 // ---------------------------------------------------------------- V100 (Lapilli): Q5_K columns, R rows a warp
-// BASALT_MULTI_V70=R (read once; 1, 2 or 4 rows a warp, 0 off; unset: on for compute capability 7.x, 4 rows a warp from
-// 5 columns and 2 below, the fastest measured on V100; native_mmvq_set_multi_v70 sets it for tests):
+// BASALT_MULTI_V70=R (read once; 1, 2 or 4 rows a warp; auto: on for compute capability 7.x, 4 rows a warp from 5 columns
+// and 2 below, the fastest measured on V100; unset or 0: off, the default; native_mmvq_set_multi_v70 sets it for tests):
 // Q5_K calls with ncols > 1 take native_q5_k_multi_v70_kernel. On V100 the layouts above are bound by the activation
 // reads, not by the weights: each thread reads its slot's q8_1 words again for every row and every column (36 words for
 // 8 weight words at 6 columns). Here a warp takes R rows and walks their slots once: a slot's words for the NCOLS
 // columns (two q8_1 blocks each: 4 words and 2 scales, the ones Q5KTraits::apply reads) go into registers once and serve
 // the R rows. Same products and scales as Q5KTraits; the sums are grouped by lane (32 per row and column) then warp_sum,
-// so not bitwise a single-column call's: float rounding only.
-int g_multi_v70 = [] {   // -1: the device decides (on for compute capability 7.x)
+// so not bitwise a single-column call's: float rounding only. Off by default: with it, a row's result depends on how many
+// columns its call holds (dec_gdn_parity and q5k_head_parity check that a column is the same at every width), so a
+// drafter's verify window could change the text. DeepSeek-V4.1-Flash turns it on at load (native_mmvq_default_multi_v70):
+// its text already depends on where its experts live, and the layout writes its code ~7 % faster with the drafter.
+int g_multi_v70 = [] {   // 0: off (the default); -1: the device decides (on for compute capability 7.x)
     const char* e = std::getenv("BASALT_MULTI_V70");
-    if (e == nullptr || *e == 0) return -1;
+    if (e == nullptr || *e == 0) return 0;
+    if (e[0] == 'a' && e[1] == 'u' && e[2] == 't' && e[3] == 'o' && e[4] == 0) return -1;
     const int r = std::atoi(e);
     return (r == 1 || r == 2 || r == 4) ? r : 0;
 }();
@@ -1512,7 +1516,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if constexpr (std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
         // the same switch for Q8_0, on the shapes where the V100 bench found it faster: 5 columns or more and long rows or
         // many of them (at 3 columns, or on a few short rows, the exact layout's four warps a row win), 4 rows a warp
-        static const bool q80_on = [] {   // BASALT_Q80_V70=1 (read once): off by default, no gain measured in decode
+        static const bool q80_on = [] {   // BASALT_Q80_V70=1 (read once; needs BASALT_MULTI_V70 on): no gain measured
             const char* e = std::getenv("BASALT_Q80_V70");
             return e != nullptr && e[0] == '1' && e[1] == 0;
         }();
@@ -1902,6 +1906,10 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_multi_v70(int rows) { g_multi_v70 = rows == -1 ? -1 : (rows == 1 || rows == 2 || rows == 4) ? rows : 0; }
+void native_mmvq_default_multi_v70(int rows) {   // a model's default, only while BASALT_MULTI_V70 is unset (the variable wins)
+    const char* e = std::getenv("BASALT_MULTI_V70");
+    if (e == nullptr || *e == 0) native_mmvq_set_multi_v70(rows);
+}
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count

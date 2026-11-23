@@ -132,6 +132,10 @@ bool DsModel::load(const std::string& path, std::string& err) {
             basalt::log::info("basalt deepseek41", "Engram SSD kept awake: a read after %.0f ms without one, until 60 s after the last request", ka_ms);
         }
     }
+    // The V100 layout of the Q5_K multi-column products is on for this model unless BASALT_MULTI_V70 says otherwise (0 turns
+    // it off): a row's bits then depend on its window's width, but this model's text already depends on where its experts
+    // live (resident, the second card, RAM), and the layout writes code ~7 % faster with the drafter on V100.
+    basalt::kernels::native_mmvq_default_multi_v70(-1);
     return true;
 }
 
