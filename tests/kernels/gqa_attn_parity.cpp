@@ -78,6 +78,36 @@ int main(int argc, char** argv) {
         std::printf("no GPU\n");
         return 77;
     }
+    if (argc > 3 && std::strcmp(argv[1], "--decode-only") == 0) {   // one decode case alone, for a profiler:
+        // the int8 cache (the 27B's) in a 65536-cell capacity, T rows ending at CELLS, 50 calls [of decode variant V]
+        const int64_t cap = 65536, cells = std::atoll(argv[2]);
+        const int T = std::atoi(argv[3]);
+        if (cells < T || cells > cap || T < 1 || T > 16) {
+            std::printf("--decode-only CELLS T: 1 <= T <= 16, T <= CELLS <= %lld\n", (long long) cap);
+            return 2;
+        }
+        basalt::kernels::KvInt8 d8;
+        cudaMalloc(&d8.k, (size_t) cap * NKV * HD);
+        cudaMalloc(&d8.v, (size_t) cap * NKV * HD);
+        cudaMalloc(&d8.ks, (size_t) cap * NKV * HD / 64 * 2);
+        cudaMalloc(&d8.vs, (size_t) cap * NKV * HD / 64 * 2);
+        cudaMemset(d8.k, 0x11, (size_t) cap * NKV * HD);
+        cudaMemset(d8.v, 0x11, (size_t) cap * NKV * HD);
+        cudaMemset(d8.ks, 0x20, (size_t) cap * NKV * HD / 64 * 2);
+        cudaMemset(d8.vs, 0x20, (size_t) cap * NKV * HD / 64 * 2);
+        float *dq = nullptr, *dout = nullptr, *dscr = nullptr;
+        cudaMalloc(&dq, (size_t) 16 * NH * HD * 4);
+        cudaMalloc(&dout, (size_t) 16 * NH * HD * 4);
+        cudaMalloc(&dscr, basalt::kernels::gqa_decode_scratch_floats(cap, 16, NH) * 4);
+        cudaMemset(dq, 0x3C, (size_t) 16 * NH * HD * 4);
+        if (argc > 4) basalt::kernels::gqa_set_decode_variant(std::atoi(argv[4]));   // the variant (default: as the variable says)
+        for (int i = 0; i < 50; ++i)
+            basalt::kernels::gqa_decode_attn(dq, nullptr, nullptr, NH, NKV, cells - T, T, dscr, cap, dout, nullptr, nullptr, d8);
+        basalt::kernels::gqa_set_decode_variant(0);
+        const cudaError_t e = cudaDeviceSynchronize();
+        std::printf("decode-only: %lld cells, %d rows, 50 calls: %s\n", (long long) cells, T, cudaGetErrorString(e));
+        return e == cudaSuccess ? 0 : 1;
+    }
     {   // the one-pass decode rescales rows by Volta's WMMA accumulator layout: is it this card's?
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);

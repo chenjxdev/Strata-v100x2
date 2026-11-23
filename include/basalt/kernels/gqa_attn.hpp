@@ -46,8 +46,8 @@ struct KvFar {
 /// Scratch floats gqa_decode_attn needs for up to `max_cells` cells and `T` rows (gqa_window_attn: cells its window
 /// spans plus the window's rows).
 size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_dim = 256);
-/// (V100) The decode kernel: 3 = one pass (the default), 2 and 1 = two passes (the same bits as each other), 0 = as
-/// BASALT_ATTN_V says (unset: 3).  For the parity test.
+/// (V100) The decode kernel: 3 = one pass (the default), 2 and 1 = two passes (the same bits as each other), 4 = Volta's
+/// m8n8k4, 0 = as BASALT_ATTN_V says (unset: 3).  For the parity test.
 void gqa_set_decode_variant(int v);
 /// Whether this card's WMMA accumulator layout is the one the one-pass decode rescales by (the parity test checks it).
 bool gqa_wmma_layout_ok();

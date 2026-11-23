@@ -248,6 +248,7 @@ struct Options {
     std::string community_file;          // --community-file: the table the row is added to
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
+    int depth_decode = 0;                // --depth-decode N: tokens written after each -p prompt (0: one, the prefill alone)
 };
 
 void usage(const std::string& engine) {
@@ -260,6 +261,8 @@ void usage(const std::string& engine) {
         "  -t LIST            decode fixtures, any of conv,struct,prose; they always run in that order, because\n"
         "                     draft state carries across requests: one fixture alone does not match a full run\n"
         "  -p LIST            prefill depths in tokens (16384,32768,65536,131072; 32k style also accepted)\n"
+        "  --depth-decode N   after each -p prompt, write N tokens (the --seed sampling, temperature 0, the end tokens\n"
+        "                     banned) and report the writing speed at that depth (default: one token, the prefill alone)\n"
         "  -r N               repetitions of the whole set (default 1); with N > 1 the table shows mean +- stddev\n"
         "                     and the first repetition is the cold one\n"
         "  --quality [N]      the quality gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
@@ -391,6 +394,11 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             if (!all_digits(v.c_str()) || std::strtoull(v.c_str(), nullptr, 10) == 0) { err = "--seed needs an integer >= 1"; return false; }
             o.seed = std::strtoull(v.c_str(), nullptr, 10);
         } else if (a == "--quality-t") o.quality_t = std::atoi(next("--quality-t").c_str());
+        else if (a == "--depth-decode") {
+            const std::string v = next("--depth-decode");
+            if (!all_digits(v.c_str()) || std::atoi(v.c_str()) < 1) { err = "--depth-decode needs an integer >= 1"; return false; }
+            o.depth_decode = std::atoi(v.c_str());
+        }
         else if (a == "-p") {
             o.sel_prefill = true;
             for (const auto& d : split(next("-p"), ',')) {
@@ -428,6 +436,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
                         : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : o.depth_decode ? "--depth-decode"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -840,7 +849,7 @@ int main(int argc, char** argv) {
             for (long long depth : o.depths) {
                 const double scale = (double) depth / (double) kPrefillBase;
                 need = std::max(need, (long long) ((double) prefill_parts[1].size() * scale) + (long long) prefill_parts[0].size() +
-                                          (long long) prefill_parts[2].size() + kPrefillBaseDecode + 16);
+                                          (long long) prefill_parts[2].size() + std::max<long long>(kPrefillBaseDecode, o.depth_decode) + 16);
             }
         set_arg(args, "--max-context", std::to_string(need));
     }
@@ -1030,7 +1039,15 @@ int main(int argc, char** argv) {
                 r.name = "prefill";
                 r.run = run;
                 r.depth = depth;
-                if (!eng.request(" top_p=0.95 top_k=20", depth == kPrefillBase ? kPrefillBaseDecode : 1, ids, r.d)) {
+                const bool write = o.depth_decode > 0 && depth != kPrefillBase;
+                std::string keys = write ? sampling_keys(0.0, o.seed) : std::string(" top_p=0.95 top_k=20");
+                if (write && eng.info.count("eos_ids") && !eng.info["eos_ids"].empty()) {   // all N tokens: the ends banned
+                    std::string bias;
+                    for (const auto& id : split(eng.info["eos_ids"], ',')) bias += (bias.empty() ? "" : ",") + id + ":-100";
+                    keys += " logit_bias=" + bias;
+                }
+                if (!eng.request(keys,
+                                 depth == kPrefillBase ? kPrefillBaseDecode : write ? o.depth_decode : 1, ids, r.d)) {
                     basalt::log::error("basalt-bench", "pp%lld (run %d): %s", depth, run, r.d.err.c_str());
                     failed = true;
                     break;
@@ -1041,6 +1058,8 @@ int main(int argc, char** argv) {
                 ++n_requests;
                 basalt::log::raw("  run %d pp%lld %lld tokens, %.0f t/s engine, %.0f t/s wall\n", run, depth, r.d.prompt,
                              prefill_engine_ts(r.d), prefill_wall_ts(r.d));
+                if (write)
+                    basalt::log::raw("  run %d pp%lld then %lld tokens written at %.1f tok/s\n", run, depth, r.d.generated, tok_s(r.d));
                 results.push_back(std::move(r));
             }
         }

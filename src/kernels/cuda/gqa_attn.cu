@@ -737,6 +737,17 @@ __global__ void __launch_bounds__(128 * NTB) decode_wmma2_kernel(const float* q_
 // the factor alpha = 2^(m_old - m_new) on what came before (the sum, and O's accumulator elements of the row: their rows
 // are Volta's WMMA layout, measured), p = 2^(s - m_new).  Another rounding than the two-pass kernels; every row still its
 // own (the same steps in the same order at any width, NTB 1 or 2).
+// The softmax of a warp's 4 rows runs side by side (one __syncwarp for the 4, the same steps row by
+// row as before: the same bits; gqa_attn_parity, int8 cache: -6 to -13 %, 64K cells one row 452 -> 414 us).  nvprof at 32K
+// cells, one row: achieved occupancy 0.11 (245 registers a thread at NTB 1: two blocks an SM), 63 % of the stalls on
+// execution dependencies.  Capping the registers (__launch_bounds__ minimum of 3 or 4 blocks) spilled: up to 4x slower.
+// Tried and removed: every tile of a segment in one block of 8 warps (K and V read once for the window, the same
+// bits): slower at every width (64K cells, 1 row 413 -> 575 us, 16 rows 1849 -> 2091).  nvprof at 32K, 1 row: 35 500
+// instructions a warp, 45 % integer (the fetch's 64-bit cell and address arithmetic, 8 pieces a thread twice a chunk).
+// Also tried and removed: prompt_wmma_kernel's way (a block per tile, its 4 warps 4 sub-splits of the split's cells
+// with their own online softmax, no block barrier, O for the whole head in 16 fragments; another rounding, the same at every
+// width, 0.000392 against double): 255 registers, no room to fetch ahead (27 % of the stalls on memory): int8 64K cells
+// 1 row 351 -> 332 us, 16 rows 1678 -> 1724, the fp16 cache slower.
 template <int HD, int NTB>
 __global__ void __launch_bounds__(128 * NTB) decode_wmma3_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs,
                                                                 int n_chunks, float scale, float* part_all) {
@@ -768,8 +779,46 @@ __global__ void __launch_bounds__(128 * NTB) decode_wmma3_kernel(const float* q_
     constexpr int LPT = CHUNK * HD / 8 / NTH;   // 8-value pieces a thread
     const bool i8 = q8.k != nullptr;
     uint4 fk[LPT], fv[LPT];                     // the next chunk's K and V (int8: .x/.y the codes, .z the scale's bits)
+    // the same loads as before, the cell and address arithmetic hoisted: a chunk that neither wraps the ring nor
+    // crosses the far cache's first cell (always, for one model in one card) steps a thread's pieces by one stride from one
+    // pointer (its cells are tid / (HD / 8) + u NTH / (HD / 8)); any other chunk takes the cell by cell path, as before
     const auto fetch = [&](int64_t c0, int64_t hi_max, bool v_too) {
-        const int64_t cell0 = c0 % r.cap;
+        const int64_t cell0 = c0 < r.cap ? c0 : c0 % r.cap;
+        const bool flat = cell0 + CHUNK <= r.cap && (cell0 + CHUNK <= fr.at || cell0 >= fr.at);
+        if (flat) {
+            constexpr int CPR = HD / 8, CSTEP = NTH / CPR;   // 8-value pieces a cell row, cells between a thread's pieces
+            static_assert(NTH % CPR == 0, "a thread's pieces one cell stride apart");
+            const int cell_t = tid / CPR, d8 = (tid % CPR) * 8;
+            const int lim = (int) max((int64_t) 0, min((int64_t) CHUNK, hi_max - c0));   // the chunk's cells below hi_max
+            const bool far_kv = cell0 >= fr.at;
+            const int64_t row_t = ((far_kv ? cell0 - fr.at : cell0) + cell_t) * n_kv + kvh;
+            const int64_t rstep = (int64_t) CSTEP * n_kv;
+            if (i8) {
+                const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                const int8_t* src = (v_too ? c8.v : c8.k) + row_t * HD + d8;
+                const uint16_t* sc = (v_too ? c8.vs : c8.ks) + row_t * (HD / 64) + d8 / 64;
+#pragma unroll
+                for (int u = 0; u < LPT; ++u) {
+                    uint4 w = make_uint4(0, 0, 0, 0);
+                    if (cell_t + CSTEP * u < lim) {
+                        const int2 b2 = *reinterpret_cast<const int2*>(src + u * rstep * HD);
+                        w = make_uint4((unsigned) b2.x, (unsigned) b2.y, sc[u * rstep * (HD / 64)], 0);
+                    }
+                    if (v_too) fv[u] = w;
+                    else fk[u] = w;
+                }
+            } else {
+                const __half* src = (v_too ? (far_kv ? (const __half*) fr.v : vc) : (far_kv ? (const __half*) fr.k : kc)) + row_t * HD + d8;
+#pragma unroll
+                for (int u = 0; u < LPT; ++u) {
+                    uint4 w = make_uint4(0, 0, 0, 0);
+                    if (cell_t + CSTEP * u < lim) w = *reinterpret_cast<const uint4*>(src + u * rstep * HD);
+                    if (v_too) fv[u] = w;
+                    else fk[u] = w;
+                }
+            }
+            return;
+        }
 #pragma unroll
         for (int u = 0; u < LPT; ++u) {
             const int idx = tid + NTH * u, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
@@ -869,25 +918,45 @@ __global__ void __launch_bounds__(128 * NTB) decode_wmma3_kernel(const float* q_
         if (mine) scores();
         __syncthreads();   // scores done: V can take the tile
         commit(true);
-        if (mine)
-            for (int i = w4; i < 16; i += 4) {   // the running max, the factor of what came before, P, the sum
-                const int64_t pos = c0 + lane;
-                const bool in = pos >= rlo[wg][i] && pos < rhi[wg][i];
-                const float sc = ss[wg][0][i][lane] + ss[wg][1][i][lane];
-                float mx = in ? sc : -INFINITY;
+        if (mine) {   // the running max, the factor of what came before, P, the sum: the warp's rows w4, w4 + 4, .. side by side
+            const int64_t pos = c0 + lane;
+            float sc[4], mx[4], mn[4], al[4], pr[4], l[4];
+            bool in[4];
 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-                const float m_old = rm[wg][i], m_new = fmaxf(m_old, mx), alpha = exp2f(m_old - m_new);
-                const float pr = in ? exp2f(sc - m_new) : 0.0f;
-                ps[wg][i][lane] = __float2half_rn(pr);
-                const float l = warp_sum(pr);
-                __syncwarp();   // every lane has read rm before lane 0 moves it
-                if (lane == 0) {
-                    rm[wg][i] = m_new;
-                    rl[wg][i] = fmaf(rl[wg][i], alpha, l);
-                    ra[wg][i] = alpha;
-                }
+            for (int k = 0; k < 4; ++k) {
+                const int i = w4 + 4 * k;
+                in[k] = pos >= rlo[wg][i] && pos < rhi[wg][i];
+                sc[k] = ss[wg][0][i][lane] + ss[wg][1][i][lane];
+                mx[k] = in[k] ? sc[k] : -INFINITY;
             }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) mx[k] = fmaxf(mx[k], __shfl_xor_sync(0xffffffffu, mx[k], o));
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int i = w4 + 4 * k;
+                const float m_old = rm[wg][i];
+                mn[k] = fmaxf(m_old, mx[k]);
+                al[k] = exp2f(m_old - mn[k]);
+                pr[k] = in[k] ? exp2f(sc[k] - mn[k]) : 0.0f;
+                ps[wg][i][lane] = __float2half_rn(pr[k]);
+                l[k] = pr[k];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)   // warp_sum, the 4 rows interleaved
+#pragma unroll
+                for (int k = 0; k < 4; ++k) l[k] += __shfl_xor_sync(0xffffffffu, l[k], o);
+            __syncwarp();   // every lane has read rm before lane 0 moves it
+            if (lane == 0)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int i = w4 + 4 * k;
+                    rm[wg][i] = mn[k];
+                    rl[wg][i] = fmaf(rl[wg][i], al[k], l[k]);
+                    ra[wg][i] = al[k];
+                }
+        }
         __syncthreads();   // V, P and the factors staged
         if (more) fetch(chunk_c0(chunk + gx), hi_max, true);
         if (mine) {
@@ -934,6 +1003,12 @@ __global__ void __launch_bounds__(128 * NTB) decode_wmma3_kernel(const float* q_
         __syncthreads();
     }
 }
+
+
+
+
+
+
 
 // ---------------------------------------------------------------- decode on Volta's own instruction
 // decode_884_kernel: mma.sync.m8n8k4 (mma884.cuh), a warp on its own: no block barrier in the sweep.  A row group = 8 rows
@@ -1241,6 +1316,7 @@ int decode_variant() {
     }();
     return v;
 }
+
 
 // segs.n and segs.row0 set: the tiles from the rows, then both kernels over every segment
 template <int HD>
