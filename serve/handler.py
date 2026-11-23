@@ -679,7 +679,7 @@ def make_handler(target: Service | Router):
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
-                                                 image_access=self._image_access())
+                                                 image_access=self._image_access(), fit=req.get("fit_max_tokens") is True)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
@@ -828,7 +828,7 @@ def make_handler(target: Service | Router):
             self.svc.load()
             try:
                 ids, thinking, max_new = self.svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force,
-                                                     image_access=self._image_access())
+                                                     image_access=self._image_access(), fit=req.get("fit_max_tokens") is True)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, or an image without vision
@@ -886,7 +886,7 @@ def make_handler(target: Service | Router):
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
-                                                 image_access=self._image_access())
+                                                 image_access=self._image_access(), fit=req.get("fit_max_tokens") is True)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,

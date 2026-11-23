@@ -672,6 +672,14 @@ div.outil__cle { margin: 0 0 6px; }
   .table-requetes .c-msg, .table-requetes .c-lec, .table-requetes .c-duree, .table-requetes .c-ecrit { display: none; }
   .moniteur .table th, .moniteur .table td { padding-left: 7px; padding-right: 7px; }
 }
+/* a phone (390 px): the three columns left (time with its date, finish, writing) were 10 to 18 px wider than the
+   card (the widest: "Nov 17, 10:29:30 AM", "Max length", "130.4"); closer cells, a smaller text and chips for this table only,
+   every column kept */
+@media (max-width: 480px) {
+  .moniteur .table-requetes th, .moniteur .table-requetes td { padding-left: 5px; padding-right: 5px; }
+  .moniteur .table-requetes td { font-size: 12px; }
+  .moniteur .table-requetes .badge { padding: 0 8px; gap: 5px; }
+}
 /* Records and totals, full width between 721 and 1100 px: the records and the totals side by side */
 @media (max-width: 1100px) and (min-width: 721px) {
   .apercu__rang > .records-carte { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px 32px; align-items: start; }

@@ -894,29 +894,31 @@ class Service:
         if not state.startswith("on"):
             _refuse_images("this server cannot read video: " + state[4:].strip())
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None, fit=False):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
-        connection may name as an image; without one, the remote policy."""
+        connection may name as an image; without one, the remote policy.  `fit` (the request's fit_max_tokens:
+        true): this request's max_new is a cap, cut to the room the context leaves, as --fit-max-tokens
+        does for every request, instead of a 400."""
         self.embeddings.path = None
         kwargs = self.thinking_kwargs(kwargs)
         try:
-            return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
+            return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources, fit)
         except BaseException:
             if self.embeddings.path:
                 Path(self.embeddings.path).unlink(missing_ok=True)
                 self.embeddings.path = None
             raise
 
-    def _prepare_text(self, messages, tools, kwargs, max_new, force):
+    def _prepare_text(self, messages, tools, kwargs, max_new, force, fit=False):
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
         tail = force if force and kwargs.get("enable_thinking", True) is False else ""
         resumed = self._exact_resume(text, plain, tail)        # a follow-up reuses the whole engine cache
         if resumed is not None:
-            return self._fit(resumed, kwargs, max_new)
+            return self._fit(resumed, kwargs, max_new, fit)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -927,7 +929,7 @@ class Service:
         unset = max_new is None or max_new <= 0
         if unset:
             max_new = ctx - CTX_SLACK
-        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens)
+        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens or fit)
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -991,7 +993,7 @@ class Service:
         if not all(images):
             _refuse_images(IMAGE_USAGE)
 
-    def _prepare(self, messages, tools, kwargs, max_new, force, image_access):
+    def _prepare(self, messages, tools, kwargs, max_new, force, image_access, fit=False):
         media = media_of(messages)
         images = [item["source"] for item in media if item["type"] == "image"]
         videos = [item for item in media if item["type"] == "video"]
@@ -1000,7 +1002,7 @@ class Service:
         if videos:
             self._check_videos(videos)
         if not media and getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
-            return self._prepare_text(messages, tools, kwargs, max_new, force)
+            return self._prepare_text(messages, tools, kwargs, max_new, force, fit)
         results, spliced = [], None
         if media:
             results = self._encode_media(media, images, videos, image_access)
@@ -1011,7 +1013,7 @@ class Service:
             ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
         if images:
             ids = self._expand_images(ids, [r for r in results if isinstance(r, int)])
-        return self._fit(ids, kwargs, max_new)
+        return self._fit(ids, kwargs, max_new, fit)
 
     def _encode_media(self, media, images, videos, image_access) -> list:
         """The request's images and videos read and encoded into one embeddings file in prompt order
@@ -1080,7 +1082,7 @@ class Service:
             _refuse_images("the prompt and its images do not match")
         return out
 
-    def _fit(self, ids, kwargs, max_new):
+    def _fit(self, ids, kwargs, max_new, fit=False):
         """(ids, thinking, max_new) with the answer cap settled against the context."""
         ctx = self.engine.max_context
         if ctx <= 0:
@@ -1091,12 +1093,13 @@ class Service:
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
         room = ctx - CTX_SLACK - len(ids)
-        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+        fit = self.fit_max_tokens or fit
+        if max_new is None or max_new <= 0 or (fit and room < 1):
             if room < 1:
                 raise room_error(len(ids), ctx)
             max_new = room
         elif max_new > room:
-            if not self.fit_max_tokens:
+            if not fit:
                 raise overflow_error(len(ids), max_new, ctx)
             max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new

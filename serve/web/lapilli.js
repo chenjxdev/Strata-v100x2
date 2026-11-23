@@ -163,6 +163,7 @@ async function lireSante() {
     const r = await fetch("health", {cache: "no-store"});
     if (!r.ok) throw await refus(r);
     sante = await r.json();
+    chargerTiroir();   // the length steps follow this server's context
     $("champ-cle").hidden = !sante.api_key && !memoire.lire("cle", "");
     // the button says what the server can read
     const joindre = sante.images ? "Attach a text file or an image (or drop them here, or paste a screenshot)" : "Attach a text file (or drop it here)";
@@ -611,8 +612,15 @@ function majLapilli(el, m, vivant) {
     notes.push(`<div class="fin-note"><span class="fin-note__texte">${ic("info", "ic ic--p")}<span>${m.outils.length > 1 ? "The model wanted to use tools." : "The model wanted to use a tool."} This page has none: nothing was run.</span></span></div>`);
   }
   if (!vivant && m.fin === "length") {
-    notes.push(`<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response reached the maximum length${m.limite ? ` (${nf(m.limite)} tokens)` : ""}.</span></span>` +
-      `<button type="button" class="btn btn--doux" data-ouvrir-reglages>Settings</button></div>`);
+    // the length the response asked for, or the end of the context: with no length, or fewer tokens than the
+    // length asked (the server cut it to the room the conversation left), it is the context that stopped it, and the
+    // settings cannot give it more room
+    const contexte = !m.limite || (m.ecrits != null && m.ecrits < m.limite);
+    const ctx = +sante.max_context || 0;
+    notes.push(contexte
+      ? `<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response filled the model's context${ctx ? ` (${nf(ctx)}\u00a0tokens)` : ""}.</span></span></div>`
+      : `<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response reached the maximum length (${nf(m.limite)}\u00a0tokens).</span></span>` +
+        `<button type="button" class="btn btn--doux" data-ouvrir-reglages>Settings</button></div>`);
   }
   const notesHtml = notes.join("");
   if (fin._notes !== notesHtml) { fin._notes = notesHtml; fin.innerHTML = notesHtml; }
@@ -807,12 +815,30 @@ function resumeReglages() {
   const l = reglages.longueur > 0 ? `${nf(reglages.longueur)} tokens max` : "no limit";
   $("reglage-resume").textContent = `${NOMS_REFLEXION[reglages.reflexion] || "Medium thinking"} · ${l}`;
 }
+// the lengths a response may ask for: from 1,024 up to the server's context (/health max_context: the steps below
+// it, then "No limit", the rest of the context), not a list that stopped at 32,768 whatever the model; an unknown context
+// keeps that list.  A chosen length goes with fit_max_tokens (the server cuts it to the room the conversation leaves).
+const PALIERS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+let paliersPour = -1;
+function construirePaliers() {
+  const ctx = +sante.max_context || 0;
+  if (ctx === paliersPour) return;
+  paliersPour = ctx;
+  const option = (v, texte) => { const o = document.createElement("option"); o.value = String(v); o.textContent = texte; return o; };
+  const valeurs = PALIERS.filter((v) => (ctx > 0 ? v < ctx : v <= 32768));
+  $("r-longueur").replaceChildren(...valeurs.map((v) => option(v, `${nf(v)} tokens`)), option(0, "No limit"));
+  const c = $("r-contexte");
+  c.hidden = !(ctx > 0);
+  c.textContent = ctx > 0 ? `This model's context: ${nf(ctx)}\u00a0tokens, the conversation and the response together.` : "";
+}
 function chargerTiroir() {
   for (const b of $("r-reflexion").children) b.setAttribute("aria-checked", String(b.dataset.v === reglages.reflexion));
   $("o-reflexion").textContent = AIDE_REFLEXION[reglages.reflexion] || "";
+  construirePaliers();
   const sel = $("r-longueur");
-  if (![...sel.options].some((o) => +o.value === +reglages.longueur)) {
-    const o = document.createElement("option"); o.value = String(reglages.longueur); o.textContent = `${nf(reglages.longueur)} tokens`; sel.appendChild(o);
+  if (![...sel.options].some((o) => +o.value === +reglages.longueur)) {   // a length kept from another model: in its place
+    const o = document.createElement("option"); o.value = String(reglages.longueur); o.textContent = `${nf(reglages.longueur)} tokens`;
+    sel.insertBefore(o, [...sel.options].find((x) => +x.value === 0 || +x.value > reglages.longueur) || null);
   }
   sel.value = String(reglages.longueur);
   $("r-montrer").setAttribute("aria-checked", String(!!reglages.montrer));
@@ -1139,7 +1165,10 @@ async function demander(c) {
 
   const corps = {model: (mesures && mesures.engine && mesures.engine.model) || sante.model || "flash-next", messages: messagesApi(c, m), stream: true,
                  reasoning_effort: reglages.reflexion};
-  if (reglages.longueur > 0) corps.max_tokens = reglages.longueur;
+  if (reglages.longueur > 0) {   // a cap the server fits to the room the conversation leaves (fit_max_tokens), never a refusal
+    corps.max_tokens = reglages.longueur;
+    corps.fit_max_tokens = true;
+  }
   if (reglages.temperature != null) corps.temperature = reglages.temperature;
   if (reglages.temperature !== 0) {
     if (reglages.top_p != null) corps.top_p = reglages.top_p;
@@ -1226,6 +1255,7 @@ async function demander(c) {
   m.fin = fin;
   const duree = (maintenant - enCours.debut) / 1000;
   const n = usage ? usage.completion_tokens : null;
+  m.ecrits = n;   // the end notice tells a length reached from a context filled
   const meta = [];
   if (m.arretee) meta.push("Stopped");
   if (m.erreur) meta.push("Error");

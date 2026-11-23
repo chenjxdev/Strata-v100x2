@@ -33,9 +33,11 @@ class ContextOverflow(unittest.TestCase):
     def setUp(self):
         self.svc.fit_max_tokens = False
 
-    def post(self, path, key, prompt_tokens, max_tokens=None, stream=False):
+    def post(self, path, key, prompt_tokens, max_tokens=None, stream=False, fit=None):
         body = {"model": "basalt", "input": "hi"} if path == "/v1/responses" else {"model": "basalt", "messages": [{"role": "user", "content": "hi"}]}
         body["stream"] = stream
+        if fit is not None:
+            body["fit_max_tokens"] = fit
         if max_tokens is not None:
             body[key] = max_tokens
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -76,6 +78,24 @@ class ContextOverflow(unittest.TestCase):
                     self.assertEqual(status, 400, body)
                     self.assertIn("exceeds the context window", body["error"]["message"])
 
+    def test_a_request_may_ask_its_cap_to_fit_the_room(self):
+        # fit_max_tokens: true in the request (the page sends it with a chosen length): the cap is cut to the room,
+        # as --fit-max-tokens does for every request; false, absent or not a boolean: the 400 as before; no room at all: the 400
+        for path, key in APIS:
+            with self.subTest(path=path):
+                with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
+                    status, _, body = self.post(path, key, 1024, CTX, False, fit=True)
+                self.assertEqual(status, 200, body)
+                ids, cap = generate.call_args[0][0], generate.call_args[0][1]
+                self.assertEqual(len(ids) + cap, CTX - CTX_SLACK)   # the engine's cap: exactly the room the context leaves
+                for stream in (False, True):
+                    for fit in (None, False, "true", 1):
+                        status, _, body = self.post(path, key, 1024, CTX, stream, fit=fit)
+                        self.assertEqual(status, 400, (stream, fit, body))
+                        self.assertIn(f"+ max tokens ({CTX})", body["error"]["message"])
+                    status, _, body = self.post(path, key, CTX - CTX_SLACK, 16, stream, fit=True)
+                    self.assertEqual(status, 400, (stream, body))
+                    self.assertIn("no room to answer", body["error"]["message"])
 
 if __name__ == "__main__":
     unittest.main()
