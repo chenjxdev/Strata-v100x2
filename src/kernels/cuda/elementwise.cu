@@ -1,16 +1,18 @@
-// src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
-#include "strata/kernels/elementwise.hpp"
+// src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/dp4a.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -71,7 +73,7 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 __global__ void silu_kernel(float* __restrict__ x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
+    // DOUBLE then cast, matching the Python reference's numpy: its arrays are f32 but `np.exp` on an f32 array is
     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
     // difference is in the last bits and this is one line.
     const double v = (double) x[i];
@@ -100,7 +102,7 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
     float acc = 0.0f;
     for (int64_t c = lane; c < cols; c += 32) acc += r[c] * r[c];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-    // The MEAN, not the sum: `ref/qsa.py::rms_norm` divides by `np.mean(np.square(x))`.  Broadcasting the
+    // The MEAN, not the sum: the Python reference divides by `np.mean(np.square(x))`.  Broadcasting the
     // reciprocal from lane 0 keeps all 32 lanes on the same value - computing `rsqrt` per lane would be the
     // same number but a needless 32-way divergence in the last bit.
     float inv = 0.0f;
@@ -113,7 +115,7 @@ void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -121,7 +123,7 @@ void sync_if_needed(void* stream, const char* what) {
 bool check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s launch: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -182,33 +184,9 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     sync_if_needed(stream, "silu_inplace");
 }
 
-/// THE DOORBELL.  One thread, one INCREMENT - the cost is the launch, and inside a graph that is paid once.
-///
-/// **IT INCREMENTS THE MEMORY, AND IT DOES NOT TAKE THE VALUE AS AN ARGUMENT.**  The first version did -
-/// doorbell_ring(d_seq, *(h_seq) + 1u) - and that is a CLONED LITERAL: the expression is evaluated on the HOST
-/// at CAPTURE time, so the graph rings 1 on every replay and a host waiting for a change waits forever.  It
-/// would have looked like a working doorbell on the first token, which is the worst way for it to be wrong.
-/// **THE FENCE IS NOT DECORATION, AND ITS ABSENCE WAS COSTING ~10 ms PER TOKEN ON THE HOST SIDE.**
-///
-/// The ring PUBLISHES three buffers the host is about to read - `h_x_f`, `h_ids`, `h_weights` - so the increment
-/// must be ordered after their writes, or the host can observe the ring and then read a payload that has not
-/// landed.  `__threadfence_system()` is what orders them, and it covers the HOST as well as the device, which is
-/// the whole point: the reader is the CPU.
-///
-/// Without it the host loop was compensating with a driver call.  `session_loop` polled with `cudaEventQuery`
-/// on EVERY spin iteration, because round 195 had measured that a memory-only spin never saw the datum flip -
-/// and that measurement was right about the symptom and wrong about the cause.  The cause is this missing fence:
-/// the write was not ordered into host-visible memory, so no amount of reading it would show it, and the driver
-/// call was flushing the whole pipeline enough to make it appear.  A 10-22 us driver call per iteration is a
-/// very expensive substitute for one fence instruction.
-__global__ void doorbell_ring_kernel(uint32_t* seq) {
-    __threadfence_system();
-    *seq = *seq + 1u;
-}
-
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
-    while (*flag != want) __nanosleep(100);
+    while (*flag != want) spin_pause();
     __threadfence_system();
 }
 
@@ -218,6 +196,16 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     check_launch("doorbell_wait");
 }
 
+__global__ void wait_word_kernel(const volatile uint32_t* word, uint32_t value) {
+    while (*word != value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_word(const uint32_t* word, uint32_t value, void* stream) {
+    wait_word_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value);
+    check_launch("wait_word");
+}
+
 __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
         const float4 v = const_cast<const float4*>(src)[i];
@@ -225,10 +213,192 @@ __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile
     }
 }
 
+// the CPU rows of a verify window, skipping the rows the GPU plan computes itself (the
+// pool writes +0.0 into those, so this writes +0.0 too): block = row, the plan's hit rows `dst[0, *count)`.
+__global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
+                                             const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count) {
+    const int row = blockIdx.x;
+    __shared__ int hit;
+    if (threadIdx.x == 0) {
+        int h = 0;
+        const int c = *count;
+        for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        hit = h;
+    }
+    __syncthreads();
+    float4* d = dst + (int64_t) row * row4;
+    if (hit) {
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        const volatile float4* sr = src + (int64_t) row * row4;
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
+    }
+}
+namespace {
+__global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* __restrict__ rows,
+                                    int64_t w4, const int32_t* __restrict__ count) {
+    const int64_t r = blockIdx.x;
+    if (count && r >= *count) return;
+    const float4* s = src + r * w4;
+    float4* d = dst + (int64_t) rows[r] * w4;
+    for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
+}
+}  // namespace
+void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream,
+                      const int32_t* count) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4,
+                                                                         count);
+}
+void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
+                           const int32_t* count, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
+                                                                                  width / 4, hit_rows, count);
+}
+// See elementwise.hpp (an expert's rows have distinct tokens: one writer per element)
+__global__ void accumulate_rows_kernel(float4* __restrict__ acc, const float4* __restrict__ rows, const float* __restrict__ w,
+                                       const int32_t* __restrict__ tok, int64_t n, int64_t row4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n * row4; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = i / row4, c = i % row4;
+        const float a = w[r];
+        const float4 v = rows[i];
+        float4 s = acc[(int64_t) tok[r] * row4 + c];
+        s.x = fmaf(a, v.x, s.x);
+        s.y = fmaf(a, v.y, s.y);
+        s.z = fmaf(a, v.z, s.z);
+        s.w = fmaf(a, v.w, s.w);
+        acc[(int64_t) tok[r] * row4 + c] = s;
+    }
+}
+
+void accumulate_rows(float* acc, const float* rows, const float* w, const int32_t* tok, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) acc & 15) != 0 || ((uintptr_t) rows & 15) != 0) {
+        basalt::log::error("basalt", "accumulate_rows: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t row4 = width / 4, total = n * row4;
+    const int blocks = (int) ((total + 255) / 256 < 1024 ? (total + 255) / 256 : 1024);
+    accumulate_rows_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) acc, (const float4*) rows, w, tok, n, row4);
+    check_launch("accumulate_rows");
+}
+
+// See elementwise.hpp (the second card's per-token sums as FP16, a power of two per row)
+__global__ void rows_to_f16_scaled_kernel(const float* __restrict__ acc, uint16_t* __restrict__ out, float* __restrict__ scale,
+                                          int64_t width) {
+    const int64_t r = blockIdx.x;
+    const float* a = acc + r * width;
+    float m = 0.0f;
+    for (int64_t c = threadIdx.x; c < width; c += blockDim.x) m = fmaxf(m, fabsf(a[c]));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float part[32];
+    __shared__ float inv_sh;
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mm = 0.0f;
+        for (int w = 0; w < (int) ((blockDim.x + 31) >> 5); ++w) mm = fmaxf(mm, part[w]);
+        float s = 1.0f, inv = 1.0f;
+        if (mm > 0.0f && isfinite(mm)) {   // the row's largest |value| lands in [2^14, 2^15)
+            const int e = max(ilogbf(mm), -100);
+            s = ldexpf(1.0f, e - 14);
+            inv = ldexpf(1.0f, 14 - e);
+        }
+        scale[r] = s;
+        inv_sh = inv;
+    }
+    __syncthreads();
+    const float inv = inv_sh;
+    for (int64_t c = threadIdx.x; c < width; c += blockDim.x) out[r * width + c] = f16_from_f32(a[c] * inv);
+}
+
+__global__ void rows_from_f16_scaled_mapped_kernel(float4* __restrict__ dst, const volatile uint4* src, const volatile float* scale,
+                                                   int64_t width8) {
+    const int64_t r = blockIdx.x;
+    __shared__ float s_sh;
+    if (threadIdx.x == 0) s_sh = scale[r];
+    __syncthreads();
+    const float s = s_sh;
+    for (int64_t c = threadIdx.x; c < width8; c += blockDim.x) {
+        const uint4 v = const_cast<const uint4*>(src)[r * width8 + c];
+        float4 lo, hi;
+        lo.x = f32_from_f16((uint16_t) (v.x & 0xFFFFu)) * s;
+        lo.y = f32_from_f16((uint16_t) (v.x >> 16)) * s;
+        lo.z = f32_from_f16((uint16_t) (v.y & 0xFFFFu)) * s;
+        lo.w = f32_from_f16((uint16_t) (v.y >> 16)) * s;
+        hi.x = f32_from_f16((uint16_t) (v.z & 0xFFFFu)) * s;
+        hi.y = f32_from_f16((uint16_t) (v.z >> 16)) * s;
+        hi.z = f32_from_f16((uint16_t) (v.w & 0xFFFFu)) * s;
+        hi.w = f32_from_f16((uint16_t) (v.w >> 16)) * s;
+        dst[(r * width8 + c) * 2] = lo;
+        dst[(r * width8 + c) * 2 + 1] = hi;
+    }
+}
+
+void rows_to_f16_scaled(const float* acc, uint16_t* out, float* scale, int64_t rows, int64_t width, void* stream) {
+    if (rows <= 0) return;
+    rows_to_f16_scaled_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(acc, out, scale, width);
+    check_launch("rows_to_f16_scaled");
+}
+
+void rows_from_f16_scaled_mapped(float* dst, const void* src, const float* scale, int64_t rows, int64_t width, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 7) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "rows_from_f16_scaled_mapped: width must be a multiple of 8 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    rows_from_f16_scaled_mapped_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile uint4*) src, (const volatile float*) scale, width / 8);
+    check_launch("rows_from_f16_scaled_mapped");
+}
+
+// See elementwise.hpp (one block a token, its rows in expert order, the same fmaf chain as accumulate_rows)
+__global__ void accumulate_rows_csr_kernel(float4* __restrict__ acc, const float4* __restrict__ rows, const float* __restrict__ w,
+                                           const int32_t* __restrict__ utok, const int32_t* __restrict__ off,
+                                           const int32_t* __restrict__ idx, int64_t row4) {
+    const int64_t u = blockIdx.x;
+    const int64_t t = utok[u];
+    const int32_t k0 = off[u], k1 = off[u + 1];
+    for (int64_t c = threadIdx.x; c < row4; c += blockDim.x) {
+        float4 s = acc[t * row4 + c];
+        for (int32_t k = k0; k < k1; ++k) {
+            const int64_t r = idx[k];
+            const float a = w[r];
+            const float4 v = rows[r * row4 + c];
+            s.x = fmaf(a, v.x, s.x);
+            s.y = fmaf(a, v.y, s.y);
+            s.z = fmaf(a, v.z, s.z);
+            s.w = fmaf(a, v.w, s.w);
+        }
+        acc[t * row4 + c] = s;
+    }
+}
+
+void accumulate_rows_csr(float* acc, const float* rows, const float* w, const int32_t* utok, const int32_t* off,
+                         const int32_t* idx, int64_t n_tokens, int64_t width, void* stream) {
+    if (n_tokens <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) acc & 15) != 0 || ((uintptr_t) rows & 15) != 0) {
+        basalt::log::error("basalt", "accumulate_rows_csr: width must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    accumulate_rows_csr_kernel<<<(unsigned) n_tokens, 128, 0, (cudaStream_t) stream>>>((float4*) acc, (const float4*) rows, w,
+                                                                                        utok, off, idx, width / 4);
+    check_launch("accumulate_rows_csr");
+}
+
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
-        std::fprintf(stderr, "copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned\n");
+        basalt::log::error("basalt", "copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
     const int64_t n4 = n / 4;
@@ -241,21 +411,68 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    if ((int) threadIdx.x < k) {
+        ids_out[threadIdx.x] = ids[threadIdx.x];
+        if (w_out != nullptr) w_out[threadIdx.x] = w[threadIdx.x];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+    }
+}
+
+__global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                            const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                                            float* x_out, int32_t* ids_out, uint32_t* seq) {
+    int any_miss = 0;
+    if ((int) threadIdx.x < k) {
+        const int32_t id = ids[threadIdx.x];
+        ids_out[threadIdx.x] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    if (__syncthreads_or(any_miss)) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+        __threadfence_system();
+    } else if ((int) threadIdx.x < k) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+    }
+}
+
+// The same publish, but the ring is STORED (the step's own number, known at
+// capture) instead of read-modify-written over PCIe - one store, no read of host memory from the GPU.
+__global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                              const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
+                                              float* w_out, uint32_t* seq, uint32_t value) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
     if ((int) threadIdx.x < k) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
-        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        *(volatile uint32_t*) seq = value;
+        __threadfence_system();
     }
 }
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }
     doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
+}
+
+void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish_res: k too large"); std::exit(1); }
+    doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
+                                                                        x_out, ids_out, d_seq);
+    check_launch("doorbell_publish_res");
 }
 
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
@@ -268,11 +485,24 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     check_launch("copy_i32_from_mapped");
 }
 
-void doorbell_ring(uint32_t* d_seq, void* stream) {
-    if (d_seq == nullptr) return;
-    doorbell_ring_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_seq);
-    check_launch("doorbell_ring");
-    sync_if_needed(stream, "doorbell_ring");
+// a thread per value, so the reads over the link overlap instead of following each other
+__global__ void copy_i32x3_from_mapped_kernel(int32_t* __restrict__ d0, const volatile int32_t* s0, int n0,
+                                              int32_t* __restrict__ d1, const volatile int32_t* s1, int n1,
+                                              int32_t* __restrict__ d2, const volatile int32_t* s2, int n2) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n0) d0[i] = s0[i];
+    else if (i < n0 + n1) d1[i - n0] = s1[i - n0];
+    else if (i < n0 + n1 + n2) d2[i - n0 - n1] = s2[i - n0 - n1];
+}
+
+void copy_i32x3_from_mapped(int32_t* d0, const int32_t* s0, int64_t n0, int32_t* d1, const int32_t* s1, int64_t n1,
+                            int32_t* d2, const int32_t* s2, int64_t n2, void* stream) {
+    const int64_t n = n0 + n1 + n2;
+    if (n <= 0) return;
+    copy_i32x3_from_mapped_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        d0, (const volatile int32_t*) s0, (int) n0, d1, (const volatile int32_t*) s1, (int) n1, d2,
+        (const volatile int32_t*) s2, (int) n2);
+    check_launch("copy_i32x3_from_mapped");
 }
 
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {
@@ -286,4 +516,4 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     sync_if_needed(stream, "rms_norm_weighted");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

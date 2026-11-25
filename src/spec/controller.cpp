@@ -1,15 +1,15 @@
-// src/spec/controller.cpp - see include/strata/spec/controller.hpp.
-#include "strata/spec/controller.hpp"
+// src/spec/controller.cpp - see include/basalt/spec/controller.hpp.
+#include "basalt/spec/controller.hpp"
 
 #include <algorithm>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 double CostModel::step_ms(int k, bool mtp) const {
     const int n = std::clamp(k + 1, 1, K_MAX + 1);
     const double dense = dense_ms * dense_ratio[n - 1];
     // CPU misses: distinct experts grow as U(n); each extra token routed to a missed expert adds a fraction of a
-    // read. Tokens per distinct expert = n / U(n)-ratio (U measured in units of one token's 10 experts).
+    // read. Tokens per distinct expert = n / U(n)-ratio (U in units of one token's 10 experts).
     const double u = distinct_ratio[n - 1];
     const double uses_per_expert = (double) n / u;
     const double cpu = (1.0 - hit_rate) * cpu_all_miss_ms * u * (1.0 + extra_use_cost * (uses_per_expert - 1.0));
@@ -18,8 +18,8 @@ double CostModel::step_ms(int k, bool mtp) const {
 }
 
 Controller::Controller(CostModel cost, double min_gain, double ema) : cost_(cost), min_gain_(min_gain), ema_(ema) {
-    // Priors: MTP per-position acceptance from flyweight's measurement on this model (0.86 per draft); lookup by
-    // match length from the offline replay (2026-09-23-suffix-lookup). Both are then learned per session.
+    // Priors: MTP per-position acceptance (0.86 per draft); lookup acceptance by
+    // match length. Both are then learned per session.
     mtp_p_.fill(0.86);
     lookup_q_ = {0.35, 0.6, 0.8, 0.92};
 }
@@ -70,4 +70,4 @@ void Controller::observe(const Choice& c, int accepted, int lookup_match) {
         for (int i = c.k; i < K_MAX; ++i) mtp_p_[i] += ema_ * (mtp_p_[c.k - 1] - mtp_p_[i]);
 }
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

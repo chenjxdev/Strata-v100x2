@@ -1,26 +1,26 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
-#include "strata/core/weights.hpp"
+#include "basalt/core/weights.hpp"
+#include "basalt/core/direct_upload.hpp"
+#include "basalt/core/load_progress.hpp"
 
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cinttypes>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
-#if defined(_WIN32)
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
-
-namespace strata::core {
+namespace basalt::core {
 namespace {
 
-constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
+constexpr uint64_t CHUNK = basalt::core::DirectUploader::kChunk;   // SOURCE bytes per staging round
 
 double now_ms() {
     using namespace std::chrono;
@@ -37,7 +37,7 @@ struct IndexRow {
     uint64_t codes_bytes = 0, scales_bytes = 0, offset_bytes = 0;
     int scales_fp16 = 0;
     int act_kind = 0;
-    bool raw16 = false;   ///< plan v0.3 P6: already 16-bit in the file (kinds 4/5)
+    bool raw16 = false;   ///< already 16-bit in the file (kinds 4/5)
 };
 
 /// How a segment's bytes must be transformed on the way from the pack to the arena.
@@ -50,9 +50,9 @@ enum class Conv : int {
 
 /// One contiguous run of a tensor's source span with a single destination range and one transform.
 ///
-/// THE SEGMENT LIST IS WHY THIS LOADER CAN CHANGE WIDTHS PLANE BY PLANE.  A quantized tensor used to be one
-/// verbatim span, which is only correct when every plane is already in engine form - and for 90 of the 303
-/// quantized tensors the scale plane is fp16 in the pack and must be f32 in the arena.
+/// THE SEGMENT LIST IS WHY THIS LOADER CAN CHANGE WIDTHS PLANE BY PLANE.  A quantized tensor as one
+/// verbatim span is only correct when every plane is already in engine form - and for tensors whose scale
+/// plane is fp16 in the file it must be f32 in the arena.
 struct Seg {
     uint64_t src_off = 0;   ///< relative to the row's src_off
     uint64_t src_bytes = 0;
@@ -61,41 +61,44 @@ struct Seg {
     Conv conv = Conv::Copy;
 };
 
-const char* file_name(int id) {
-    switch (id) {
-        case 0: return "dense.bin";
-        case 1: return "embd.bin";
-        case 2: return "experts.bin";
-        case 3: return "extra.bin";   // plan v0.3 P6: a native pack's float tensors that the base pack quantized
-        default: return nullptr;
+/// The index's lines, one at a time (the index is a small text file).
+struct IndexText {
+    std::vector<uint8_t> raw;
+    size_t at = 0;
+    bool open(const FileRange& r, std::string& err) {
+        if (r.empty() || !read_range(r, raw, err)) { if (err.empty()) err = "no pack index"; return false; }
+        return true;
     }
-}
-
-/// UTF-16 path for CreateFile-free portability: the loader uses `std::fopen`, which on Windows takes an ANSI
-/// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
-/// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
-bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-#if defined(_WIN32)
-    if (_fseeki64(f, (long long) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#else
-    if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#endif
-    if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
-    return true;
-}
+    /// The next line into `line` (NUL-terminated, at most `cap` - 1 bytes); false at the end.
+    bool next(char* line, size_t cap) {
+        if (at >= raw.size()) return false;
+        size_t n = 0;
+        while (at < raw.size() && raw[at] != '\n') { if (n + 1 < cap) line[n++] = (char) raw[at]; ++at; }
+        if (at < raw.size()) ++at;
+        line[n] = 0;
+        return true;
+    }
+};
 
 }  // namespace
 
-bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
+PackFiles PackFiles::from(const ModelSources& s) {
+    PackFiles p;
+    p.index = s.dense_index;
+    p.files[0] = s.dense;
+    return p;
+}
+
+bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,
                              const std::set<std::string>* skip) {
-    const std::string path = pack_dir + "/index.txt";
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) { err = "cannot open " + path; return false; }
+    const std::string path = pack.index.path;
+    IndexText f;
+    if (!f.open(pack.index, err)) { err = "cannot open " + path + (err.empty() ? "" : " (" + err + ")"); return false; }
     char line[1024];
     out = 0;
     uint64_t pool = 0, compact = 0;
     int align = 0;
-    while (std::fgets(line, sizeof line, f)) {
+    while (f.next(line, sizeof line)) {
         if (line[0] == '#') {
             unsigned long long p = 0;
             int a = 0, tensors = 0;
@@ -112,23 +115,72 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         compact += (dst_bytes + a - 1) / a * a;
     }
-    std::fclose(f);
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
     out = skip ? compact : pool;
     return true;
 }
 
-bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip) {
-    const std::string path = pack_dir + "/index.txt";
-    std::FILE* idx = std::fopen(path.c_str(), "rb");
-    if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
+bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
+                                      uint64_t& shared, std::string& err, const std::set<std::string>* skip) {
+    IndexText f;
+    if (!f.open(pack.index, err)) { err = "cannot open " + pack.index.path + (err.empty() ? "" : " (" + err + ")"); return false; }
+    per_layer.assign((size_t) n_layers, 0);
+    shared = 0;
+    char line[1024];
+    int align = 0;
+    while (f.next(line, sizeof line)) {
+        if (line[0] == '#') {
+            unsigned long long p = 0;
+            int a = 0, tensors = 0;
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) align = a;
+            continue;
+        }
+        char name[256] = {0};
+        unsigned long long dst_bytes = 0, dummy = 0;
+        int i1 = 0, i2 = 0;
+        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
+            continue;
+        if (skip != nullptr && skip->count(name)) continue;
+        const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        const uint64_t bytes = (dst_bytes + a - 1) / a * a;
+        const long l = std::strncmp(name, "blk.", 4) == 0 ? std::strtol(name + 4, nullptr, 10) : -1;
+        if (l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
+        else shared += bytes;
+    }
+    return true;
+}
+
+bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name, int& code_bits,
+                                  std::string& err) {
+    IndexText f;
+    if (!f.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
+    char line[1024];
+    code_bits = -1;
+    while (f.next(line, sizeof line)) {
+        if (line[0] == '#') continue;
+        char row[256] = {0};
+        unsigned long long dummy = 0;
+        long long ne = 0;
+        int i1 = 0, i2 = 0, bits = 0;
+        // the first ten fields of the row `load` parses: name file kind src_off src_bytes dst_off dst_bytes ne0 ne1 code_bits
+        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu %lld %lld %d", row, &i1, &i2, &dummy, &dummy, &dummy,
+                        &dummy, &ne, &ne, &bits) != 10)
+            continue;
+        if (name == row) { code_bits = bits; break; }
+    }
+    return true;
+}
+
+bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
+                       const std::set<std::string>* skip, bool report_progress) {
+    IndexText idx;
+    if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
 
     uint64_t pool = 0;
     int align = 0;
     std::vector<IndexRow> rows;
     char line[1024];
-    while (std::fgets(line, sizeof line, idx)) {
+    while (idx.next(line, sizeof line)) {
         if (line[0] == '#') {
             unsigned long long p = 0;
             int a = 0, t = 0;
@@ -138,10 +190,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         IndexRow r;
         char name[256] = {0};
         int kind = 0;
-        // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
+        // The format is written when the model file is built and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64
+                                  " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
@@ -149,12 +202,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         if (n != 19) {
             // A malformed index line is a WRONG BYTE OFFSET waiting to happen, and a wrong offset decodes to
             // a plausible weight.  Refuse loudly instead of loading the rows that happened to parse.
-            err = "index.txt: could not parse a row (" + std::to_string(n) + " of 19 fields)";
-            std::fclose(idx);
+            err = "dense index: could not parse a row (" + std::to_string(n) + " of 19 fields)";
             return false;
         }
         r.name = name;
-        // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
+        // 16-bit floats are stored as they are in the GGUF:
         // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
         if (kind == 4 || kind == 5) {
             r.raw16 = true;
@@ -163,9 +215,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         r.kind = (WeightKind) kind;
         rows.push_back(r);
     }
-    std::fclose(idx);
 
-    if (pool == 0 || rows.empty()) { err = "index.txt has no header or no rows"; return false; }
+    if (pool == 0 || rows.empty()) { err = "the dense index has no header or no rows"; return false; }
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
@@ -194,25 +245,28 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // bytes and every BF16 weight would have been read as 32-bit garbage.  Converted data goes to a host
     // buffer and crosses the bus once.
     //
-    // STAGE_OUT IS TWICE STAGE_IN because a conversion can now GROW: widening an fp16 scale plane to f32
+    // STAGE_OUT IS TWICE THE SIZE OF A READ because a conversion can now GROW: widening an fp16 scale plane to f32
     // doubles it.  Sized at CHUNK it would have written 8 MiB past the end of a pinned allocation for every
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
-    void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
         err = "cudaHostAlloc for the staging buffers failed";
-        if (stage_in) cudaFreeHost(stage_in);
-        if (stage_out) cudaFreeHost(stage_out);
         return false;
     }
 
     uint8_t* dst_base = (uint8_t*) arena_base;
-    std::FILE* cur = nullptr;
+    basalt::core::DirectUploader reader;   // unbuffered reads into pinned staging
     int cur_file = -1;
+    std::string cur_path;
+    uint64_t cur_base = 0, cur_size = 0;   // the current file's range: reads are relative to it
     table_.clear();
     report_ = LoadReport{};
 
+    int load_dev = 0;
+    if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
+    // a temporary load (staging that is dropped again) is not part of the model's bytes
+    std::optional<LoadProgress> progress;
+    if (report_progress) progress.emplace(LoadProgress::cuda(load_dev), pool);
     const double t_read0 = now_ms();
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
@@ -244,18 +298,21 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             continue;
         }
         if (r.code_bits != 0 && r.dst_bytes == 0) {
-            // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
-            err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
-            cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+            // a row that carries a shape only - the GGUF form must serve it
+            err = r.name + ": the model file holds the tensor only in its GGUF form";
+            cudaFreeHost(stage_out);
             return false;
         }
         if (r.file != cur_file) {
-            if (cur) std::fclose(cur);
-            const char* fn = file_name(r.file);
-            const std::string p = pack_dir + "/" + (fn ? fn : "?");
-            cur = std::fopen(p.c_str(), "rb");
-            if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
             cur_file = r.file;
+            if (r.file < 0 || r.file > 3 || pack.files[r.file].empty()) {
+                err = r.name + ": the index names file " + std::to_string(r.file) + ", which this pack does not have";
+                cudaFreeHost(stage_out);
+                return false;
+            }
+            cur_base = pack.files[r.file].offset;
+            cur_size = pack.files[r.file].bytes;
+            cur_path = pack.files[r.file].path;
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms
@@ -265,7 +322,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         uint64_t sum_src = 0, sum_dst = 0;
         if (r.codes_bytes != 0) {
             // A quantized tensor: codes, then scales, then the optional offset plane, each contiguous in the
-            // source span in that order (pack_index.py verifies the contiguity and refuses otherwise).
+            // source span in that order (the converter verifies the contiguity and refuses otherwise).
             segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
             if (r.scales_bytes) {
                 const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
@@ -317,14 +374,14 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             err = buf;
             bad = true;
         }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+        if (bad) { cudaFreeHost(stage_out); return false; }
 
         for (int si = 0; si < n_segs; ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
                 err = r.name + ": an fp16 plane with an odd source byte count";
-                cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                cudaFreeHost(stage_out);
                 return false;
             }
             uint64_t done = 0;
@@ -333,14 +390,20 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 // WIDENING NEVER SPLITS AN ELEMENT.  CHUNK is even, so a full chunk cannot, but the tail of a
                 // plane whose length is odd would - and half an fp16 is a plausible-looking scale.
                 if (widening && (n & 1ull)) {
-                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_out); return false; }
                     n -= 1;
                 }
-                if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                if (cur_size != 0 && r.src_off + s.src_off + done + n > cur_size) {
+                    err = r.name + ": runs past the end of its section";
+                    cudaFreeHost(stage_out);
                     return false;
                 }
-                const uint8_t* src = (const uint8_t*) stage_in;
+                const uint8_t* src = reader.staged(cur_path, cur_base + r.src_off + s.src_off + done, n, err);
+                if (src == nullptr) {
+                    err = r.name + ": " + err;
+                    cudaFreeHost(stage_out);
+                    return false;
+                }
                 const void* host_src = src;
                 uint64_t out_bytes = n;
                 uint64_t out_at = s.dst_off + done;
@@ -372,7 +435,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                         for (uint64_t i = 0; i < elems; ++i) {
                             float v;
                             std::memcpy(&v, src + i * 4, 4);
-                            const uint16_t h = strata::kernels::f16_from_f32(v);
+                            const uint16_t h = basalt::kernels::f16_from_f32(v);
                             std::memcpy(o + i * 2, &h, 2);
                         }
                         host_src = stage_out;
@@ -382,14 +445,14 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                     case Conv::WidenF16: {
                         // fp16 bits -> f32.  EXACT: every fp16 value is an f32 value, including the
                         // subnormals, so this cannot change a single weight - which is why the engine may do
-                        // it at all, and why doing it costs 10.88 MiB rather than a second kernel family.
+                        // it at all, and why doing it costs a little memory rather than a second kernel family.
                         const uint64_t elems = n / 2;
                         out_bytes = elems * 4;
                         float* o = (float*) stage_out;
                         for (uint64_t i = 0; i < elems; ++i) {
                             uint16_t h;
                             std::memcpy(&h, src + i * 2, 2);
-                            o[i] = strata::kernels::f32_from_f16(h);
+                            o[i] = basalt::kernels::f32_from_f16(h);
                         }
                         host_src = stage_out;
                         out_at = s.dst_off + done * 2;
@@ -401,10 +464,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
                     err = "cudaMemcpy failed for " + r.name;
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    cudaFreeHost(stage_out);
                     return false;
                 }
                 upload_ms += now_ms() - u0;
+                if (progress) progress->add(out_bytes);
                 done += n;
             }
         }
@@ -437,9 +501,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             report_.bytes_saved += r.src_bytes - r.dst_bytes;
         }
     }
-    if (cur) std::fclose(cur);
-    cudaFreeHost(stage_in);
     cudaFreeHost(stage_out);
+    if (progress) progress->finish();
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
@@ -453,4 +516,12 @@ const WeightRef* WeightTable::find(const std::string& name) const {
     return it == table_.end() ? nullptr : &it->second;
 }
 
-}  // namespace strata::core
+bool WeightTable::rebind(const std::string& name, const void* data) {
+    const auto it = table_.find(name);
+    if (it == table_.end() || data == nullptr) return false;
+    it->second.data = data;
+    it->second.resident = true;
+    return true;
+}
+
+}  // namespace basalt::core

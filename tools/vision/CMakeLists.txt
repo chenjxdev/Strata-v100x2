@@ -1,44 +1,76 @@
-# tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
-# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# tools/vision - basalt-vision, the image encoder for the multimodal path, on Basalt's own kernels (no ggml or
+# llama.cpp).  Built with the root project, or on its own:
 #
-#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
-#   cmake --build build-vision --target strata-vision
-cmake_minimum_required(VERSION 3.21)
-project(strata_vision C CXX)
-
-set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
-option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
-option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
-if(STRATA_PORTABLE AND MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+#   cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-vision --target basalt-vision
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 120)
+  endif()
+  project(basalt_vision CXX CUDA)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD 20)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+  endif()
+  option(BUILD_TESTING "Build the parity programs" OFF)
+  # the root project's `warnings` and `platform` targets, read from the one file both configurations include
+  include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/platform.cmake)
 endif()
+find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
-set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
-set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
-if(STRATA_PORTABLE)
-  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-  set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
-  foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-    set(${_f} ON CACHE BOOL "" FORCE)
-  endforeach()
+set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
+
+# host side: preprocessing, FFmpeg loaded at run time, projector file, CPU encoder
+add_library(vision_core STATIC
+  ${VISION_ROOT}/src/vision/preprocess.cpp
+  ${VISION_ROOT}/src/vision/ffmpeg_api.cpp
+  ${VISION_ROOT}/src/vision/video.cpp
+  ${VISION_ROOT}/src/vision/mrope_positions.cpp
+  ${VISION_ROOT}/src/vision/mmproj.cpp
+  ${VISION_ROOT}/src/vision/encoder_cpu.cpp
+  ${VISION_ROOT}/src/vision/gemm_cpu.cpp
+  ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
+target_include_directories(vision_core PUBLIC ${VISION_ROOT}/include PRIVATE ${VISION_ROOT}/src/vision)
+if(MSVC)
+  # /arch: selects the baseline; the intrinsics used below are available to a function that uses them either way.
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  # the AVX-512 BF16 file is only called after a run-time CPU check
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 else()
-  set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  # the AVX-512 BF16 file is only called after a run-time CPU check
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mfma")
 endif()
-set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
+target_link_libraries(vision_core PUBLIC model_file platform Threads::Threads)
 
-add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+# device side
+add_library(vision_cuda STATIC
+  ${VISION_ROOT}/src/vision/encoder_cuda.cu
+  ${VISION_ROOT}/src/vision/vision_kernels.cu)
+target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
+target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
 
-add_executable(strata-vision strata_vision.cpp)
-target_link_libraries(strata-vision PRIVATE mtmd llama)
-target_compile_features(strata-vision PRIVATE cxx_std_17)
-set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_executable(basalt-vision vision.cpp)
+target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)
+target_link_libraries(basalt-vision PRIVATE vision_cuda)
+basalt_ship_to_bin(basalt-vision)
+# The image and projector paths arrive on the command line, so this program needs the same manifest as the engine:
+# UTF-8 as the process code page and long paths. Built here directly rather than through the root project's helper,
+# because this project also configures on its own.
+if(MSVC)
+  target_link_options(basalt-vision PRIVATE "/MANIFEST:EMBED"
+                      "/MANIFESTINPUT:${VISION_ROOT}/src/platform/basalt.exe.manifest")
+endif()
+
+if(BUILD_TESTING)
+  add_executable(vision_cpu_parity ${VISION_ROOT}/tests/vision/cpu_parity.cpp)
+  target_link_libraries(vision_cpu_parity PRIVATE vision_core)
+  add_executable(vision_cuda_parity ${VISION_ROOT}/tests/vision/cuda_parity.cu)
+  target_link_libraries(vision_cuda_parity PRIVATE vision_cuda)
+  # the parity program is outside src/vision now and needs the private kernel header
+  target_include_directories(vision_cuda_parity PRIVATE ${VISION_ROOT}/src/vision)
+endif()

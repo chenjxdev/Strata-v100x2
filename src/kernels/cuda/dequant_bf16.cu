@@ -1,17 +1,19 @@
-// src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
+// src/kernels/cuda/dequant_bf16.cu - see include/basalt/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 __device__ __forceinline__ float h2f(const uint8_t* p) {
@@ -19,6 +21,9 @@ __device__ __forceinline__ float h2f(const uint8_t* p) {
 }
 __device__ __forceinline__ uint16_t f2bf(float f) {
     uint32_t u = __float_as_uint(f);
+    // a NaN (a NaN scale in the block) stays a quiet NaN, as in ggml_compute_fp32_to_bf16 and `bf16_from_f32`:
+    // the rounding add below would carry it into -0 or inf
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 64u);
     u += 0x7fffu + ((u >> 16) & 1u);          // round to nearest even
     return (uint16_t) (u >> 16);
 }
@@ -64,6 +69,17 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             put(out, j, (float) (((b[6 + j] & 0x0F) | xh0) - 16) * d);
             put(out, j + 16, (float) (((b[6 + j] >> 4) | xh1) - 16) * d);
         }
+    } else if constexpr (TYPE == 7) {                              // Q5_1
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 24;
+        const float d = h2f(b), m = h2f(b + 2);
+        const uint32_t qh = (uint32_t) b[4] | ((uint32_t) b[5] << 8) |
+                            ((uint32_t) b[6] << 16) | ((uint32_t) b[7] << 24);
+        for (int j = 0; j < 16; ++j) {
+            const int xh0 = ((qh >> j) & 1) << 4;
+            const int xh1 = ((qh >> (j + 16)) & 1) << 4;
+            put(out, j, (float) ((b[8 + j] & 15) | xh0) * d + m);
+            put(out, j + 16, (float) ((b[8 + j] >> 4) | xh1) * d + m);
+        }
     } else if constexpr (TYPE == 8) {                              // Q8_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 34;
         const float d = h2f(b);
@@ -89,12 +105,11 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
         aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
         aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
         const int shift = 2 * jj;
         const uint8_t m = (uint8_t) (1u << (n * 4 + jj));
         for (int t = 0; t < 32; ++t) {
             const int is = n * 8 + jj * 2 + (t >= 16 ? 1 : 0);
-            const float dl = d_all * (float) (scales[is] - 32);
+            const float dl = d_all * (float) (packed_s8(aux[is >> 2], is & 3) - 32);
             put(out, t, dl * (float) ((int) ((q[t] >> shift) & 3) - ((hm[t] & m) ? 0 : 4)));
         }
     } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]
@@ -151,19 +166,33 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
     }
 }
 
-template <int TYPE, typename T>
+// One thread per 32-value group.  VEC: the group's outputs are collected in registers and written as 16-byte stores
+// (the destination is 16-byte aligned and a group is 32 values), instead of 32 scalar stores.
+template <int TYPE, typename T, bool VEC>
 __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                int64_t groups_per_row, T* __restrict__ out) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    const uint8_t* row = blocks + (row0 + r) * row_bytes;
+    if constexpr (VEC) {
+        T tmp[32];
+        group32<TYPE>(row, (int) gi, tmp);
+        constexpr int n16 = 32 * (int) sizeof(T) / 16;
+        const uint4* src = reinterpret_cast<const uint4*>(tmp);
+        uint4* dst = reinterpret_cast<uint4*>(out + g * 32);
+#pragma unroll
+        for (int i = 0; i < n16; ++i) dst[i] = src[i];
+    } else {
+        group32<TYPE>(row, (int) gi, out + g * 32);
+    }
 }
 
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
     case 6: block_elems = 32; block_bytes = 22; return true;
+    case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
@@ -180,7 +209,7 @@ template <typename T>
 void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream) {
     int be = 0, bb = 0;
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
-        std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
+        basalt::log::error("basalt", "dequant: unsupported type %d or shape %lld x %lld", type, (long long) rows,
                      (long long) cols);
         std::exit(1);
     }
@@ -188,22 +217,27 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+const bool vec = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
+#define DEQUANT_CASE(TY) \
+    if (vec) dequant_kernel<TY, T, true><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); \
+    else dequant_kernel<TY, T, false><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); \
+    break
     switch (type) {
-    case 2: STRATA_DQ(2);
-    case 6: STRATA_DQ(6);
-    case 8: STRATA_DQ(8);
-    case 11: STRATA_DQ(11);
-    case 12: STRATA_DQ(12);
-    case 13: STRATA_DQ(13);
-    case 14: STRATA_DQ(14);
-    case 20: STRATA_DQ(20);
-    case 23: STRATA_DQ(23);
-    case 42: STRATA_DQ(42);
+    case 2: DEQUANT_CASE(2);
+    case 6: DEQUANT_CASE(6);
+    case 7: DEQUANT_CASE(7);
+    case 8: DEQUANT_CASE(8);
+    case 11: DEQUANT_CASE(11);
+    case 12: DEQUANT_CASE(12);
+    case 13: DEQUANT_CASE(13);
+    case 14: DEQUANT_CASE(14);
+    case 20: DEQUANT_CASE(20);
+    case 23: DEQUANT_CASE(23);
+    case 42: DEQUANT_CASE(42);
     }
-#undef STRATA_DQ
+#undef DEQUANT_CASE
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dequant launch: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace
@@ -214,7 +248,7 @@ bool dequant_bf16_supported(int ggml_type) noexcept {
 }
 
 namespace {
-// plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
+// the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
 bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
 }  // namespace
 
@@ -242,4 +276,4 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
     launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

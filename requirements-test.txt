@@ -1,0 +1,2 @@
+# What the serve tests need beyond the server.
+-r requirements.txt

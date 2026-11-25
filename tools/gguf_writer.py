@@ -1,22 +1,10 @@
-"""A minimal GGUF v3 WRITER, including `Q2_0`.
+"""A minimal GGUF v3 writer including `Q2_0`, which gguf-py cannot write (no type 42).
 
-Why this exists
----------------
-P1.S1 of the plan says the tiny synthetic model is "written as a real GGUF via `gguf-py`" using
-"at least `Q2_0`". That does not work: `gguf-py` has no `GGMLQuantizationType` member for type 42, so
-`GGMLQuantizationType(42)` raises `ValueError`. Verified in round 39 and again here.
-
-`src/artifact/` needs a writer regardless - P1.S2 requires a reader with no ggml dependency, and the
-writer is its companion - so this is that writer in Python, where it can be validated immediately
-against `tools/gguf_reader.py` and against llama.cpp.
-
-Scope: enough to build the P1.S1 tiny model. It is NOT a general-purpose quantizer; the only
-quantizer implemented is `Q2_0`, and its contract is `docs/q2_0-contract.md`:
+Enough to build the tiny synthetic model; the only quantizer is Q2_0:
     block = 64 elements, fp16 scale, 16 bytes of 2-bit codes, LSB-first, 4 codes per byte
     d = amax, code = clamp(round(w/d) + 1, 0, 3), symbol = code - 1  ->  {-1, 0, +1, +2}
 
-Self-checking: `python tools/gguf_writer.py` writes a synthetic v3 file, reads it back with
-`gguf_reader.py`, and asserts the tensors and metadata survived byte-exactly.
+`python tools/gguf_writer.py` writes a synthetic file, reads it back with `gguf_reader.py` and checks it byte-exactly.
 """
 from __future__ import annotations
 
@@ -24,21 +12,22 @@ import dataclasses
 import pathlib
 import struct
 import sys
+import tempfile
 
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
-# ggml_type ids we can write. Values match GGML_TYPES in gguf_reader.py.
-TYPE_IDS = {"F32": 0, "F16": 1, "Q2_0": 42}
+# writable ggml_type ids, matching GGML_TYPES in gguf_reader.py
+TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42, "IQ2_XXS": 16, "IQ1_S": 19, "IQ4_NL": 20, "BF16": 30}
 DEFAULT_ALIGNMENT = 32
 
 _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
              "bool": 7, "string": 8, "array": 9, "u64": 10, "i64": 11, "f64": 12}
 
 
-# ------------------------------------------------------------------ Q2_0, per docs/q2_0-contract.md
+# ------------------------------------------------------------------ Q2_0, per the Q2_0 contract
 def quantize_q2_0(w: np.ndarray) -> bytes:
     """(n,) float32 -> concatenated 18-byte blocks. n must be a multiple of 64."""
     w = np.asarray(w, dtype=np.float32).reshape(-1)
@@ -49,11 +38,11 @@ def quantize_q2_0(w: np.ndarray) -> bytes:
     for b in blocks:
         amax = float(np.max(np.abs(b)))
         d = amax
-        # d = amax (NOT amax/2) - the grid is asymmetric, symbols land in {-1,0,+1,+2}.
+        # d = amax (not amax/2): the grid is asymmetric, symbols are {-1,0,+1,+2}
         code = np.zeros(64, dtype=np.uint8) if d == 0 else \
             np.clip(np.rint(b / d).astype(np.int32) + 1, 0, 3).astype(np.uint8)
         packed = np.zeros(16, dtype=np.uint8)
-        # j -> byte j//4, bit (j%4)*2 ;  four codes per byte, least significant first.
+        # code j -> byte j//4, bit (j%4)*2
         for j in range(64):
             packed[j // 4] |= np.uint8(code[j] << ((j % 4) * 2))
         out += struct.pack("<e", d)      # fp16 scale
@@ -108,11 +97,13 @@ class GGUFWriter:
         a = np.ascontiguousarray(arr, dtype="<f4")
         self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
 
+    def add_raw(self, name: str, shape: list[int], type_name: str, data: bytes) -> None:
+        """A tensor whose blocks are given as they are stored (shape in GGUF order)."""
+        self.tensors.append(_Tensor(name, list(shape), type_name, bytes(data)))
+
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
-        """`arr` is (rows, in_features) row-major with every row `shape[0]` long; `shape` is the FULL
-        GGUF shape. The shape must be passed explicitly, not inferred as [in, rows]: a fused expert
-        tensor is [in, out, experts], and inferring 2-D produced `[64, 4096]` where llama.cpp expects
-        `[64, 256, 16]`. Q2_0 blocks run along dim 0 only, so the extra axes are just a layout.
+        """`arr` is (rows, in_features) row-major; `shape` is the full GGUF shape, passed explicitly because a
+        fused expert tensor is [in, out, experts] and cannot be inferred. Blocks run along dim 0 only.
         """
         a = np.asarray(arr, dtype=np.float32)
         in_features = shape[0]
@@ -158,7 +149,7 @@ class GGUFWriter:
         for k, (t, v) in self.metadata.items():
             body += self._kv_bytes(k, t, v)
 
-        # Tensor directory: offsets are relative to the start of the data section.
+        # tensor directory: offsets are relative to the data section
         offset = 0
         infos = bytearray()
         for t in self.tensors:
@@ -189,14 +180,14 @@ def _selfcheck() -> int:
     w.add("general.architecture", "qwen4exp")
     w.add("qwen4exp.block_count", 8, "u32")
     w.add("qwen4exp.test.array", [1, 2, 3, 4], "array:i32")
-    w.add("general.name", "strata tiny")
+    w.add("general.name", "tiny")
 
     A = rng.standard_normal((16, 64)).astype(np.float32)
     B = rng.standard_normal((4, 8)).astype(np.float32)
-    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, 64)
+    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, [64, 16])
     w.add_f32("blk.0.ssm_a", B)
 
-    p = pathlib.Path(__file__).resolve().parent.parent / "bench" / "tiny-selftest.gguf"
+    p = pathlib.Path(tempfile.mkdtemp(prefix="gguf-selfcheck-")) / "tiny-selftest.gguf"
     w.write(p)
     print(f"wrote {p.name}  ({p.stat().st_size} B)")
 
@@ -220,7 +211,7 @@ def _selfcheck() -> int:
         rel = float(np.abs(back - A.reshape(-1)).mean() / np.abs(A).mean())
         print(f"  Q2_0 round trip: max abs {err:.4f}  mean rel {rel*100:.2f}%  "
               f"(quantization error, not a write bug)")
-        # The real check: re-quantizing the DEQUANTIZED values must be a fixed point.
+        # re-quantizing the dequantized values must be a fixed point
         again = dequantize_q2_0(quantize_q2_0(back))
         if not np.array_equal(again, back):
             print("  FAIL Q2_0 is not a fixed point under requantization"); ok = False

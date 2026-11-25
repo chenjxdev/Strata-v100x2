@@ -1,605 +1,464 @@
-"""serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
+"""OpenAI, Anthropic and Responses endpoints over engines that map token ids to tokens, one model loaded at a time.
 
-    python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
+    basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
+    python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
+    python -m serve.server --config config.json          (each entry of its "models" is one model)
+    python -m serve.server --mock-engine --port 8080
 
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /health. One sequence at a time behind a FIFO (plan: one resident sequence).
-Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths; JPEG/PNG/BMP/GIF) go through `strata-vision` (the model's mmproj file) and
-reach the engine as embeddings (`GENI`).
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
-
-The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
-talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
+The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel)` -> token ids. ProcessEngine keeps
+one `basalt --serve` process resident; MockEngine is a scripted stand-in for tests. Prompts that do not fit the
+context are rejected with a 400, never truncated.
 """
 from __future__ import annotations
 
-import argparse
-import base64
-import hashlib
 import json
 import os
-import subprocess
+import signal
 import sys
-import tempfile
 import threading
 import time
-import urllib.request
-import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Iterator, Protocol
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
-
-IM_END = "<|im_end|>"
-IMAGE_PAD = "<|image_pad|>"
-
-
-# ------------------------------------------------------------------------------------------------ engines
-class Engine(Protocol):
-    max_context: int
-    def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
-
-
-class MockEngine:
-    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token."""
-
-    def __init__(self, tokenizer, script: str, max_context: int = 32768, delay_s: float = 0.0):
-        self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
-        self.script = tokenizer.encode(script, parse_special=True) + tokenizer.encode(IM_END, parse_special=True)
-        self.last_prompt: list[int] = []
-
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        self.last_prompt = list(ids)
-        self.last_embeddings = embeddings
-        for t in self.script[:max_new]:
-            if cancel.is_set():
-                return
-            if self.delay:
-                time.sleep(self.delay)
-            yield t
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
+from serve import ROOT, service  # noqa: E402
+from serve.config import (build_parser, check_engine_flags,  # noqa: E402
+                          engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
+                          sampling_items, shared_line, slot_share, start_items, with_spec)
+from serve.engine import process as engine_process  # noqa: E402
+from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.image_source import image_sources_of  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
+from serve.engine.mock import MockEngine  # noqa: E402
+from serve.engine.process import ProcessEngine  # noqa: E402
+from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
+                                 gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
+from serve.models import dialect_for  # noqa: E402
+from serve.handler import Server, serve  # noqa: E402
+from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
+                            lan_addresses, origins_of)
+from serve.router import Router  # noqa: E402
+from serve.service import Service  # noqa: E402
+from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
+from serve.util.console import LEGEND, tagged  # noqa: E402
+from serve.util.text import ByteTokenizer  # noqa: E402
 
 
-class StrataEngine:
-    """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
-    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough."""
-
-    def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None):
-        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
-        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
-        self.max_context = 0
-        self.last = {}
-        for line in self.proc.stdout:
-            if line.startswith("READY"):
-                self.max_context = int(line.split()[1])
-                break
-        if self.max_context <= 0:
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
-
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        head = f"GENI {int(max_new)} {embeddings}" if embeddings else f"GEN {int(max_new)}"
-        self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-        self.proc.stdin.flush()
-        done = False
-        try:
-            for line in self.proc.stdout:
-                if line.startswith("T "):
-                    if not cancel.is_set():
-                        yield int(line[2:])
-                elif line.startswith("DONE"):
-                    f = line.split()
-                    self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
-                                 "decode_ms": float(f[4]), "finish": f[5]}
-                    done = True
-                    return
-                elif line.startswith("ERR"):
-                    done = True
-                    raise ValueError(line[4:].strip())
-            raise RuntimeError("the engine process ended")
-        finally:
-            if not done:                                  # the consumer stopped early: drain to DONE
-                for line in self.proc.stdout:
-                    if line.startswith("DONE") or line.startswith("ERR"):
-                        break
-
-    def close(self):
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+SWAP_START_TRIES = 2      # a swap's load: a second try for VRAM still being released, not a third for clients to wait on
 
 
-class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once."""
-
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
-        if cfg.get("gpu"):
-            args.append("--gpu")
-        if cfg.get("threads"):
-            args += ["--threads", str(cfg["threads"])]
-        if cfg.get("max_tokens"):
-            args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                     text=True, encoding="utf-8", bufsize=1, env=env)
-        line = self.proc.stdout.readline()
-        if not line.startswith("READY"):
-            raise RuntimeError("the vision encoder did not start: " + line.strip())
-        self.lock = threading.Lock()
-        self.cache: dict[str, tuple[Path, int]] = {}
-
-    @staticmethod
-    def load(source: str) -> bytes:
-        if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
-        if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
-        path = source[7:] if source.startswith("file://") else source
-        if path and os.path.isfile(path):
-            return Path(path).read_bytes()
-        raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
-
-    def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
-        data = self.load(source)
-        key = hashlib.sha256(data).hexdigest()[:32]
-        with self.lock:
-            if key in self.cache:
-                return self.cache[key]
-            img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
-            self.proc.stdin.write(f"ENC {img} {out}\n")
-            self.proc.stdin.flush()
-            line = self.proc.stdout.readline().strip()
-            img.unlink(missing_ok=True)
-            if not line.startswith("OK"):
-                raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
-                                                                     "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
-            return self.cache[key]
-
-    def close(self):
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+def fail(msg: str) -> None:
+    """Print a startup error and exit with status 2."""
+    print(f"[server] error: {msg}", file=sys.stderr)
+    raise SystemExit(2)
 
 
-def child_env(cfg: dict) -> dict:
-    """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
-    env = dict(os.environ)
-    dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    if dirs:
-        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
-        env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
-    return env
+def warn_tight_ram(arena_mib) -> None:
+    """Warn at start when less than ~6 GB of RAM is left beside the expert arena (INFO arena_mib)."""
+    if not isinstance(arena_mib, int) or arena_mib <= 0:
+        return
+    try:
+        import psutil
+        total = psutil.virtual_memory().total
+    except Exception:  # noqa: BLE001 - psutil is optional here
+        return
+    left = total / 2**30 - arena_mib / 1024
+    if left < 6:
+        print(tagged("warning", f"low RAM: {left:.1f} of {total / 2**30:.0f} GB left after experts"), flush=True)
 
 
-class ByteTokenizer:
-    """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
-    SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
-
-    def encode(self, text, parse_special=False):
-        out, i = [], 0
-        while i < len(text):
-            for k, s in enumerate(self.SPECIALS):
-                if parse_special and text.startswith(s, i):
-                    out.append(256 + k)
-                    i += len(s)
-                    break
-            else:
-                out.extend(text[i].encode("utf-8"))
-                i += 1
-        return out
-
-    def decode(self, ids, errors="replace"):
-        raw = bytearray()
-        for t in ids:
-            raw += self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
-        return raw.decode("utf-8", errors=errors)
+def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str] | None:
+    """(on, origin) for the startup line when the command line or the config file set grammar; None for the default."""
+    names = ("--grammar", "--no-grammar")
+    origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
+    return (on, origin) if origin else None
 
 
-# ------------------------------------------------------------------------------------------------ core
-class Detokenizer:
-    """Incremental decode: re-decode the generated ids and emit only the new, complete suffix (a multi-byte
-    character split across tokens is held until complete)."""
+def open_when_ready(svc, url, now=False, opener=None):
+    """Open the page once, after the first weights load; at once when no load is under way (mock, lazy)."""
+    if opener is None:
+        import webbrowser
+        opener = webbrowser.open
+    if now:
+        opener(url)
+        return
+    done, previous = [], svc.on_loaded
 
-    def __init__(self, tok):
-        self.tok, self.ids, self.sent = tok, [], 0
-
-    def push(self, t: int) -> str:
-        self.ids.append(t)
-        text = self.tok.decode(self.ids)
-        if text.endswith("�"):
-            return ""
-        delta, self.sent = text[self.sent:], len(text)
-        return delta
-
-
-class Service:
-    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
-                 vision: Vision | None = None):
-        self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.fifo = threading.Lock()
-        self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
-        self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
-
-    def prepare(self, messages, tools, kwargs, max_new):
-        prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
-        self.embeddings.path = None
-        images = images_of(messages)
-        if images:
-            if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (run setup again and choose "
-                                 "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            encoded = [self.vision.encode(src) for src in images]
-            out, k = [], 0
-            for t in ids:                               # one <|image_pad|> per image -> one per image token
-                if t == pad and k < len(encoded):
-                    out += [pad] * encoded[k][1]
-                    k += 1
-                else:
-                    out.append(t)
-            if k != len(encoded):
-                raise ValueError("the prompt and its images do not match")
-            ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
-            self.embeddings.path = combined
-        if len(ids) + max_new > self.engine.max_context:
-            raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                             f"({self.engine.max_context}); requests are never truncated")
-        return ids, kwargs.get("enable_thinking", True) is not False
-
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
-        parser, detok, n, finish = OutputParser(thinking=thinking, tools=tools), Detokenizer(self.tok), 0, "length"
-        emb = getattr(self.embeddings, "path", None)
-        try:
-            with self.fifo:
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
-                for t in gen:
-                    n += 1
-                    if t in self.stop_ids:
-                        finish = "stop"
-                        break
-                    for ev in parser.feed(detok.push(t)):
-                        yield "event", ev
-        finally:
-            if emb:
-                Path(emb).unlink(missing_ok=True)
-        for ev in parser.finish():
-            yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n}
+    def loaded():
+        if previous is not None:
+            previous()
+        if not done:
+            done.append(1)
+            opener(url)
+    svc.on_loaded = loaded
 
 
-# ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
-    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
-
-    def chunk(delta, finish=None):
-        return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": svc.model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-
-    yield chunk({"role": "assistant", "content": ""})
-    calls = 0
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
-        if kind == "event":
-            ev: Event = x
-            if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
-            elif ev.kind == "content" and ev.text:
-                yield chunk({"content": ev.text})
-            elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name,
-                                                          "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
-                calls += 1
+def model_file_problems(settings) -> list[str]:
+    """One plain line for each configured model whose file is missing, a directory or unreadable (the same paths the
+    engine is given: relative ones are already resolved against the config file)."""
+    out = []
+    for i, (m, *_rest) in enumerate(settings):
+        if not m.model or not m.engine_bin or (m.mock_engine and m.config):
+            continue
+        if m.config:
+            who = f"model '{m.alias}'" if m.alias else f"models[{i}]"
+            where = f' (the "model" key in {Path(m.config).name})'
         else:
-            finish = "tool_calls" if calls and x["finish"] == "stop" else x["finish"]
-            last = chunk({}, finish)
-            last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
-                             "total_tokens": len(ids) + x["completion_tokens"]}
-            yield last
-
-
-def openai_collect(chunks) -> dict:
-    content, reasoning, calls, last = [], [], [], None
-    for c in chunks:
-        d = c["choices"][0]["delta"]
-        content.append(d.get("content") or "")
-        reasoning.append(d.get("reasoning_content") or "")
-        calls += [{k: v for k, v in tc.items() if k != "index"} for tc in d.get("tool_calls") or []]
-        last = c
-    msg = {"role": "assistant", "content": "".join(content) or None}
-    if "".join(reasoning):
-        msg["reasoning_content"] = "".join(reasoning)
-    if calls:
-        msg["tool_calls"] = calls
-    return {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
-            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-            "usage": last["usage"]}
-
-
-# ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
-    mid = "msg_" + uuid.uuid4().hex[:24]
-    yield "message_start", {"type": "message_start", "message": {
-        "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
-    index, open_kind, used_tool = -1, None, False
-
-    def close():
-        return ("content_block_stop", {"type": "content_block_stop", "index": index})
-
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
-        if kind == "event":
-            ev: Event = x
-            want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use"}[ev.kind]
-            if ev.kind != "tool_call" and not ev.text:
-                continue
-            if open_kind != want or want == "tool_use":
-                if open_kind is not None:
-                    yield close()
-                index += 1
-                open_kind = want
-                block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
-                         "text": {"type": "text", "text": ""},
-                         "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
-                                      ev.call.name if ev.call else "", "input": {}}}[want]
-                yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
-            if want == "thinking":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "thinking_delta", "thinking": ev.text}}
-            elif want == "text":
-                yield "content_block_delta", {"type": "content_block_delta", "index": index,
-                                              "delta": {"type": "text_delta", "text": ev.text}}
-            else:
-                used_tool = True
-                yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
-                    "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
+            who, where = "model", " (--model)"
+        if os.path.isdir(m.model):
+            why = f"{m.model} is a directory, not a model file"
+        elif not os.path.exists(m.model):
+            why = f"file not found: {m.model}"
         else:
-            if open_kind is not None:
-                yield close()
-            stop = "tool_use" if used_tool and x["finish"] == "stop" else \
-                {"stop": "end_turn", "length": "max_tokens"}[x["finish"]]
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
-                                    "usage": {"output_tokens": x["completion_tokens"]}}
-            yield "message_stop", {"type": "message_stop"}
-
-
-def anthropic_collect(events) -> dict:
-    msg, blocks = None, []
-    for name, e in events:
-        if name == "message_start":
-            msg = e["message"]
-        elif name == "content_block_start":
-            blocks.append(dict(e["content_block"]))
-        elif name == "content_block_delta":
-            d, b = e["delta"], blocks[-1]
-            if d["type"] == "text_delta":
-                b["text"] += d["text"]
-            elif d["type"] == "thinking_delta":
-                b["thinking"] += d["thinking"]
-            else:
-                b["input"] = json.loads(d["partial_json"])
-        elif name == "message_delta":
-            msg["stop_reason"] = e["delta"]["stop_reason"]
-            msg["usage"]["output_tokens"] = e["usage"]["output_tokens"]
-    msg["content"] = blocks
-    return msg
-
-
-# ------------------------------------------------------------------------------------------------ HTTP
-def make_handler(svc: Service):
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
-
-        def log_message(self, fmt, *args):
-            pass
-
-        def _json(self, code, obj):
-            body = json.dumps(obj, ensure_ascii=False).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _authorized(self) -> bool:
-            if not svc.api_key:
-                return True
-            auth = self.headers.get("Authorization", "")
-            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if given == svc.api_key:
-                return True
-            self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
-            return False
-
-        def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
-            if path == "":
-                body = (ROOT / "serve" / "index.html").read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path == "/health":
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
-            elif path == "/v1/models":
-                if self._authorized():
-                    self._json(200, {"object": "list", "data": [{"id": svc.model, "object": "model"}]})
-            else:
-                self._json(404, {"error": {"message": "not found"}})
-
-        def do_POST(self):
-            if not self._authorized():
-                return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                if self.path.rstrip("/") == "/v1/chat/completions":
-                    self._openai(req)
-                elif self.path.rstrip("/") == "/v1/messages":
-                    self._anthropic(req)
-                else:
-                    self._json(404, {"error": {"message": "not found"}})
+                with open(m.model, "rb"):
+                    continue
+            except OSError as e:
+                why = f"can't read {m.model}: {e.strerror or e}"
+        out.append(f"{who}: {why}{where}")
+    return out
+
+
+def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: list[str], known) -> dict:
+    """What one configured model's file and flags imply, by the engine's own rules and without loading anything; fail()
+    for what stops the start."""
+    cfg = {}                                            # what the model file implies
+    lines = cfg["start_lines"] = []                     # printed with the model's other lines once all are checked
+    try:
+        check_gpu(a.gpu)
+    except ValueError:
+        fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
+    if not a.mock_engine and not (a.model and a.engine_bin):
+        fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
+    if (file_engine or cli_engine) and not a.model:
+        fail("engine flags need --model")
+    pack = bool(a.model) and not (a.mock_engine and a.config)   # the scripted engine of a config file reads no model files
+    if pack:
+        if not a.engine_bin:
+            fail("--model needs --engine-bin BINARY")
+        from serve.engine import modelfile
+        try:
+            check_engine_flags(file_engine, known, f"--config {a.config}")
+            check_engine_flags(cli_engine, known, "command line")
+        except ValueError as e:
+            fail(str(e))
+        mode = a.vision
+        spec = modelfile.ModelSpec(a.model, alias=a.alias, gpu=a.gpu,
+                                   vision=False if a.mock_engine or mode == "off" else mode,
+                                   engine_words=tuple(file_engine + cli_engine))
+        try:
+            cfg.update(modelfile.model_config(spec, a.engine_bin))
+        except (OSError, ValueError, KeyError) as e:
+            fail(f"{a.model}: {e}")
+        if not a.mock_engine:
+            # the engine's own choice and its own flag rules, printed once here; the engine then sees only these cards,
+            # main first
+            try:
+                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words))
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-
-        def _sse(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-
-        def _openai(self, req):
-            messages, tools, kw = openai_to_messages(req)
-            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 1024)
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
-            cancel = threading.Event()
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
-            if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
-            self._sse()
-            try:
-                for c in chunks:
-                    self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                cancel.set()                                 # client went away: stop at the next step
-
-        def _anthropic(self, req):
-            messages, tools, kw = anthropic_to_messages(req)
-            max_new = int(req.get("max_tokens") or 1024)
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
-            cancel = threading.Event()
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
-            if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
-            self._sse()
-            try:
-                for name, e in events:
-                    self.wfile.write(f"event: {name}\n".encode() + b"data: " +
-                                     json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-            except OSError:
-                cancel.set()
-
-    return Handler
+                fail(f"{a.model}: {e}")
+            card = vision_card(mode)
+            if card is not None:                       # a numbered sidecar card: the engine's sm_120 rule is the
+                if gpu_card_name(card) is None:        # engine's; the sidecar is its own build and says whether
+                    fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
+            for note in plan.get("notes") or []:
+                lines.append(f"[server] {note}")
+            if plan.get("warning"):
+                lines.append(f"[server] warning: {plan['warning']}")
+            cfg["gpu"] = plan["devices"]
+            cfg["spec"] = plan.get("spec")
+            if getattr(a, "split_default", False) and plan.get("max_context"):
+                # the engine's default context, shared by the slots
+                a.shared_context = int(plan["max_context"])
+                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
+                cfg["args"] += part
+                cli_engine += part
+            cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
+            cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
+    for flag in a.skipped:
+        lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
+    cfg["items"] = start_items(file_engine, cli_engine,
+                               (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
+                               grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
+    cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
+    if a.alias and not pack:
+        cfg["model_name"] = a.alias
+    if not cfg.get("model_name") and a.model:
+        cfg["model_name"] = Path(a.model).name
+    return cfg
 
 
-class Server(ThreadingHTTPServer):
-    # On Windows SO_REUSEADDR lets a second server bind a port that is already serving, and requests then land on
-    # either one (a forgotten second start of run-<model>.bat).  Without it the second start fails loudly instead.
-    allow_reuse_address = os.name != "nt"
+def drop_sidecar_vision(cfg: dict) -> None:
+    """Only a sidecar encoder holds VRAM before the first request; `dynamic` encodes inside the engine, which the
+    request loads first anyway."""
+    if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
+        return
+    print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
+    del cfg["vision"]
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
-    httpd = Server((host, port), make_handler(svc))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
-    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
-                                     "written by setup.py")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--script", default="Thinking about it.</think>\n\nHello from the mock engine.")
-    ap.add_argument("--port", type=int, default=8095)
-    ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
-                    help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
-    ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
-    a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8")) if a.config else {}
-    try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
-        ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
-                 f"Close it, or start this one with a different --port")
-    if cfg.get("tokenizer"):
-        a.tokenizer = cfg["tokenizer"]
+def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
+    """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
+    turn too."""
+    from serve.engine import modelfile
+    files = cfg.get("tokenizer")
+    if files is None:                                   # the mock engine: a directory, or the byte tokenizer without one
+        tdir = Path(a.tokenizer)
+        files = {n: (tdir / n).read_bytes() for n in modelfile.TOKENIZER_SECTIONS if (tdir / n).exists()}
+    if not a.mock_engine and "vocab.json" not in files:
+        fail(f"tokenizer missing: {a.tokenizer}/vocab.json")
     tok = ByteTokenizer()
-    tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
-        import strata_tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+    if "vocab.json" in files:
+        import tokenizer as ST
+        vocab = json.loads(files["vocab.json"].decode("utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
-    if a.engine == "strata":
-        if not cfg:
-            ap.error("--engine strata needs --config")
+        merges = files["merges.txt"].decode("utf-8").split("\n")
+        types = json.loads(files["token_type.json"])
+        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
+        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
+    has_grammar = False
+    if not a.mock_engine:
         vision = None
         env = child_env(cfg)
+        sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
+        if a.lazy and not multi:
+            drop_sidecar_vision(cfg)
+        shown = [x for x in cfg["items"] if x not in cfg.get("shared_items", ())]
+        shown += sampling_items(sampling_defaults) + [x for x in [vision_item(cfg.get("vision"), cfg)] if x]
+        print(model_line(cfg["model_name"], cfg.get("name_width", 0), shown), flush=True)
+        for line in cfg["start_lines"]:
+            print(line, flush=True)
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
-            vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=env)
-        print("loading the model (the first start takes a minute or two) ...", flush=True)
-        engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+            mode = cfg["vision"].get("mode")
+            if mode == "dynamic":
+                vision = EngineVision(cfg["vision"])
+            else:
+                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=vision_env(env, mode), start=not multi)
+        if a.lazy and not multi:
+            print(tagged("model", "unloaded, the first request loads it"), flush=True)
+        if cfg.get("log"):                              # follow the engine's log file
+            threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
+        else:
+            ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
+        has_grammar = known is not None and "--grammar" in known
+        if a.grammar and not has_grammar:
+            print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
+        gwords = grammar_words(known)
+        cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
+        cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
+        if cdir and cmib != "0" and a.debug:
+            print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
+        # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
+        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        if isinstance(vision, EngineVision):
+            vision.attach(engine)
     else:
-        engine, vision = MockEngine(tok, a.script), None
-    svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision)
-    svc.api_key = a.api_key or cfg.get("api_key", "")
-    httpd = serve(svc, host=a.host, port=a.port)
-    print(f"ready: http://{a.host}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
-          f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{a.host}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
-    if a.open:
-        import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        engine, vision, sampling_defaults = MockEngine(tok, a.script or [
+            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
+    # the model's exported template, else the bundled one
+    dialect = dialect_for(cfg.get("arch"))
+    template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
+        (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+    svc = Service(engine, tok, dialect.template(template),
+                  model_name=cfg.get("model_name", "basalt"), vision=vision,
+                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
+    svc.logs = logs
+    svc.idle_unload_s = a.idle_unload or 0
+    svc.idle_sleep_s = a.idle_sleep or 0
+    svc.min_free_vram_mib = a.min_free_vram_mib or 0
+    svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
+    svc.answer_room = a.answer_room
+    svc.reasoning_effort = a.reasoning_effort
+    svc.thinking_loop_tokens = a.thinking_loop_tokens
+    svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
+    svc.gpu_index = svc.gpu_indices[0]
+    if multi:
+        svc.start_tries = SWAP_START_TRIES
+    return svc
+
+
+def check_models(services: list[Service]) -> None:
+    """Refuse model names that answer for two entries, and one conversation folder shared by two: each model's chats keep
+    their own budget."""
+    seen: dict[str, Service] = {}
+    folders: dict[str, str] = {}
+    for svc in services:
+        for name in svc.served_names():
+            if seen.setdefault(name, svc) is not svc:
+                fail(f"--config: {name!r} names two models: give each its own alias")
+        args = getattr(svc.engine, "spawn", (None, []))[1]
+        where = flag_value(args, "--conversation-cache-dir")
+        if where and (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" and \
+                folders.setdefault(where, svc.model) != svc.model:
+            fail(f"--config: {svc.model} and {folders[where]} share the conversation folder {where}: give each its own")
+
+
+def main() -> int:
+    ap = build_parser()
+    engine_bin = ap.parse_known_args(sys.argv[1:])[0].engine_bin
     try:
-        threading.Event().wait()
+        settings = model_settings(ap, sys.argv[1:], (lambda path, group: flag_refused(engine_bin, path, group))
+                                  if engine_bin else None)
+    except ValueError as e:
+        fail(f"--config: {e}")
+    a = settings[0][0]                                  # the options every model shares read the same in each
+    multi = len(settings) > 1
+    service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
+    logs = LogBuffer()                                  # this process's and the engine's output
+    sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
+                              TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
+    print(tagged("legend", LEGEND), flush=True)          # first line, so the key precedes every value
+    problems = model_file_problems(settings)
+    for line in problems:
+        print(f"[server] error: {line}", file=sys.stderr)
+    if problems:
+        return 2
+    known = engine_flags_of(a.engine_bin) if a.engine_bin else None
+    cfgs = [check_model(m, file_engine, cli_engine, used_argv, known)
+            for m, used_argv, file_engine, cli_engine in settings]
+    if (a.image_url_host or a.image_dir) and not a.mock_engine and all(m[0].vision == "off" for m in settings):
+        fail("--image-url-host and --image-dir need --vision (image input is off)")
+    try:
+        image_sources = image_sources_of(a.image_url_host, a.image_dir, a.image_remote_only)
+    except ValueError as e:
+        fail(str(e))
+    try:                                                # fail fast if the port is taken
+        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+    except OSError:
+        fail(f"port {a.port} is in use (--port N)")
+    width = max(len(c.get("model_name") or "") for c in cfgs) + 1
+    shared = [x for x in cfgs[0].get("items", []) if all(x in c.get("items", []) for c in cfgs[1:])] if multi else []
+    line, shared_sleep = shared_line(shared, [m[0].idle_sleep for m in settings])
+    if line:
+        print(tagged("engine", line), flush=True)
+    for c in cfgs:
+        c["shared_items"], c["name_width"] = shared, width
+    services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
+    check_models(services)
+    router = Router(services)
+    svc = router.front
+    svc.image_sources = image_sources
+    if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
+        print(tagged("images", f"from other machines{' and this one' if image_sources.remote_only else ''}: "
+                               f"url-hosts={','.join(a.image_url_host) or '-'} "
+                               f"dirs={','.join(image_sources.dirs) or '-'}"), flush=True)
+    used_argv = settings[0][1]
+    if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
+           for i, x in enumerate(used_argv)):
+        # an empty key would silently disable authentication
+        print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
+        return 2
+    if a.max_payload_mib < 1:
+        fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
+    svc.max_payload = a.max_payload_mib << 20
+    try:
+        svc.api_key = api_key_of(a.api_key)
+    except ValueError as e:
+        print(f"[server] error: {e}: give a key, or leave --api-key out", file=sys.stderr)
+        return 2
+    try:
+        svc.cors_origins = origins_of(a.cors_origin, "--cors-origin", wildcard=True)
+        svc.allowed_hosts = allowed_hosts_of(a.allowed_host)
+    except (ValueError, SystemExit) as e:
+        fail(str(e).removeprefix("[server] error: "))
+    if svc.allowed_hosts:
+        print(tagged("warning", "Host check off, any name is accepted (--allowed-host *)") if "*" in svc.allowed_hosts
+              else tagged("hosts", ",".join(svc.allowed_hosts)), flush=True)
+    if svc.cors_origins:
+        print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
+        if "*" in svc.cors_origins and not svc.api_key:
+            print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
+    httpd = serve(router, host=a.host, port=a.port)
+    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+
+    def announcer(s: Service, m):
+        first_load, said_video = [True], [False]
+
+        def announce():
+            """After every weights load: the slot table once, then the weights line (no URL)."""
+            engine = s.engine
+            if first_load[0]:
+                first_load[0] = False
+                if not a.mock_engine:
+                    warn_tight_ram(engine.info.get("arena_mib"))
+                if getattr(engine, "batch", 0):
+                    print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
+                                 + (" (slot-full-context)" if m.slot_full_context else "") + ", others queue"), flush=True)
+            print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
+                                    f"images={'on' if s.vision else 'off'}"), flush=True)
+            # with image input on, whether video works too: the encoder's own word (FFmpeg found or not), once
+            video = s.vision.video_state() if s.vision is not None and hasattr(s.vision, "video_state") else None
+            if video and not said_video[0]:
+                said_video[0] = True
+                state, _, why = video.partition(" ")
+                print(tagged("video", f"{state}, {why}" if s.dialect.video_pad else "off, this model reads no video"),
+                      flush=True)
+        return announce
+
+    for s, m in zip(services, (x[0] for x in settings)):
+        s.start_idle_unload()
+        s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
+        s.on_loaded = announcer(s, m)
+
+    # the one place the addresses and the APIs are printed: the server listens before the model loads
+    print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  stats http://{here}:{a.port}/"
+                 + (" api-key=on" if svc.api_key else "")), flush=True)
+    if a.mock_engine:
+        for s in services:
+            s.on_loaded()
+    if a.host not in LOOPBACK_NAMES:
+        # reachable from other devices: print the addresses
+        ips = lan_addresses()
+        for ip in ips:
+            print(tagged("network", f"http://{ip}:{a.port}/v1"), flush=True)
+        if not ips:
+            print(tagged("network", f"port={a.port}"), flush=True)
+        if exposed_without_key(a.host, svc.api_key):
+            print(tagged("warning", "no api key, open to the network (--api-key KEY)"), flush=True)
+    if not a.mock_engine and not a.lazy:
+        if multi:
+            router.preload(svc)                         # the first entry; a failed load leaves the others servable
+        else:
+            svc.start_load()                            # the page and the API are up; requests wait for the load
+    if a.open:
+        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
+                        now=bool(a.mock_engine or a.lazy))
+    # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
+    def on_sigterm(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a later TERM must not cut the engine's QUIT short
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, on_sigterm)
+    except (ValueError, OSError, AttributeError):         # not the main thread
+        pass
+    rc = 0
+    try:
+        while True:
+            time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
+            if svc.boot_error is not None:              # the start-up load failed: requests waiting on it get the error
+                time.sleep(2)
+                rc = 1
+                raise KeyboardInterrupt
     except KeyboardInterrupt:
-        httpd.shutdown()
-        if hasattr(engine, "close"):
-            engine.close()
-        if vision:
-            vision.close()
-    return 0
+        if not rc:
+            print("[server] stopping (Ctrl+C again to force)", flush=True)
+        closers = [router.stop, httpd.shutdown]
+        for s in services:
+            closers += [getattr(s.engine, "close", None), s.vision.close if s.vision else None]
+        for close in filter(None, closers):
+            try:
+                close()
+            except KeyboardInterrupt:                   # second Ctrl+C: do not wait for the engine
+                for s in services:
+                    if getattr(s.engine, "proc", None):
+                        s.engine.proc.kill()
+        print("[server] stopped", flush=True)
+    return rc
 
 
 if __name__ == "__main__":

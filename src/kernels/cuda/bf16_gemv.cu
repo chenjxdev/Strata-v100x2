@@ -1,14 +1,15 @@
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
-#include "strata/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -68,13 +69,13 @@ __global__ void bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uin
 inline void finish(void* stream, const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s launch: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream != nullptr) return;
     const cudaError_t s = cudaDeviceSynchronize();
     if (s != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(s));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(s));
         std::exit(1);
     }
 }
@@ -83,21 +84,14 @@ inline void finish(void* stream, const char* what) {
 
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;
-    // **THIS USED TO ALWAYS USE THE NAIVE KERNEL, AND THE NAIVE KERNEL IS UNCOALESCED.**
+    // **THE NAIVE KERNEL IS UNCOALESCED, SO IT IS NOT THE DEFAULT.**
     //
     // `bf16_gemv_naive_kernel` gives one THREAD per output row and walks the row contiguously, so at a fixed
     // `i` the 32 threads of a warp read `w[(o+k)*n_in + i]` - addresses `n_in * 2` bytes apart.  Every load in
-    // the kernel's inner loop costs 32 transactions instead of 1.  The comment above that kernel claims it is
-    // "used directly for the shapes where the output width is already large", but nothing ever made that
-    // choice: this function called it unconditionally, at every shape.
+    // the kernel's inner loop costs 32 transactions instead of 1, far below the memory floor.
     //
-    // What that costs, from the nsys per-kernel table: **4.66 ms/token across 24 calls, 194 us each** - the
-    // third largest kernel in the engine at the time, moving 1.19 GiB/token at ~210 GB/s where a plain read at
-    // this geometry measures 641 GB/s (`bench/micro/p32_floor.cu`).
-    //
-    // `bf16_gemv_warp_kernel` exists, is checked against this one by `bf16_gemv_parity`, and is coalesced -
-    // consecutive lanes touch consecutive addresses - which is the property `gr_read`'s comment records as
-    // having taken it from 262 ms/token to 8.9.  The threshold below is where warp-per-row has enough rows to
+    // `bf16_gemv_warp_kernel` is checked against it by `bf16_gemv_parity` and is coalesced -
+    // consecutive lanes touch consecutive addresses - which is the property `gr_read`'s comment records.  The threshold below is where warp-per-row has enough rows to
     // fill the machine: 8 warps per block, so 64 rows is 8 blocks and 128 is 16, against 48 SMs.
     if (n_out >= 64) {
         const int warps = THREADS / 32;
@@ -128,8 +122,8 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
         return;
     }
     if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0) {
-        std::fprintf(stderr, "bf16_gemv_split: threads_per_row %d must be a power of two (32 selects the "
-                             "warp-per-row path)\n", threads_per_row);
+        basalt::log::error("basalt", "bf16_gemv_split: threads_per_row %d must be a power of two (32 selects the "
+                             "warp-per-row path)", threads_per_row);
         std::exit(1);
     }
     const unsigned grid = (unsigned) n_out;
@@ -138,4 +132,4 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     finish(stream, "bf16_gemv_split");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

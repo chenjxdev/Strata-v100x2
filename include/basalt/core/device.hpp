@@ -1,0 +1,110 @@
+// include/basalt/core/device.hpp - the device arena and the runtime's device facts.
+//
+// `DeviceArena` is ONE cudaMalloc per planner region with bump sub-allocation below it and no frees.  That is
+// not a simplification: the memory plan is fixed at startup, so the set of
+// regions and their sizes is known before anything is allocated, and an allocator that can free would be
+// solving a problem the engine does not have while adding fragmentation and failure modes it does.
+//
+// The reason to get this in early is that the VRAM budget is the binding constraint of the whole design
+// (5.95 GB pooled between KV and the expert cache, 33.97 GB of experts in DRAM).  A runtime that discovers at
+// token 4000 that it has overcommitted has already lost; the plan is printed against `cudaMemGetInfo` at
+// startup so the discrepancy is visible immediately.
+#pragma once
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace basalt::core {
+
+struct DeviceInfo {
+    int ordinal = -1;
+    std::string name;
+    int cc_major = 0, cc_minor = 0;
+    uint64_t total_bytes = 0;      // as reported by cudaMemGetInfo at query time
+    uint64_t free_bytes = 0;
+    int driver_version = 0, runtime_version = 0;
+    int multi_processor_count = 0;
+};
+
+// How many devices the runtime enumerates, numbered as CUDA_VISIBLE_DEVICES numbers them; 0 when
+// there is none (or no usable runtime).  `device_info` throws on a card this binary cannot run, so a caller that LISTS
+// every card (`basalt-device --list-devices`) counts them with this first.
+int device_count();
+
+// One line per device for `basalt-device --list-devices`, without the arch check that `device_info` applies:
+// "compute capability 12.0, 31.4 GiB", plus the device's name.  false when
+// the runtime cannot describe it.
+bool device_summary(int ordinal, std::string& name, std::string& detail);
+
+// The device's PCI bus id as the runtime spells it ("0000:01:00.0"); false when it cannot say.
+bool device_pci_bus_id(int ordinal, std::string& id);
+
+// Fixed facts of the device for splitting work between cards: its PCIe link's byte rate in one direction (the generation
+// the card and the system reach, the width it runs at, the per-lane rate of that generation) and its SM count times its
+// highest SM clock. Read from the driver, never timed, so a placement prices the same on every start; 0 when unknown.
+struct DeviceRates {
+    double link_bytes = 0;    // bytes per second
+    double sm_hz = 0;         // SMs x clock (cycles per second summed over SMs)
+};
+DeviceRates device_rates(int ordinal);
+
+// The free and total memory of `ordinal`'s card (negative: the current one). On failure `why` names the call, the error
+// and the card: "cudaMemGetInfo: out of memory (code 2), device 0 of 2".
+bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std::string& why);
+
+// Whether the runtime still serves every card in `ordinals`: a free-memory query and a 1 MiB allocation on each. A
+// process that has page-locked more host memory than the driver backs can lose both on every card while the cards
+// have room; `why` is the first failure, as `device_memory` words it.
+bool devices_allocate(const std::vector<int>& ordinals, std::string& why);
+
+// Pinned host-to-device copy speed of the device in GB/s: the best of several 256 MiB copies. 0 when the copy could not
+// be set up or timed. Uses the device briefly and frees everything before it returns.
+double device_h2d_gbps(int ordinal);
+
+// Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
+// run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and
+// this is the matching check at run time (a binary can be carried to a different machine).
+DeviceInfo device_info(int ordinal = 0);
+
+/// "" when this build has device code for the current device, else CUDA's error: a build for other GPUs would
+/// otherwise fail at its first kernel launch, with nothing that names the cause.
+std::string device_code_error();
+
+class CudaError : public std::runtime_error {
+public:
+    CudaError(const std::string& what, int code) : std::runtime_error(what), code_(code) {}
+    int code() const { return code_; }
+
+private:
+    int code_;
+};
+
+// One cudaMalloc, bump-allocated below.  `poison` fills new allocations with a NaN-ish pattern in a debug
+// build so that reading uninitialised VRAM gives a NaN rather than a plausible number - the same reasoning as
+// the harness work in Phase 1: a wrong value that looks right is the expensive kind.
+class DeviceArena {
+public:
+    explicit DeviceArena(uint64_t bytes, int ordinal = 0, bool poison = false);
+    ~DeviceArena();
+    DeviceArena(const DeviceArena&) = delete;
+    DeviceArena& operator=(const DeviceArena&) = delete;
+
+    // `align` must be a power of two; 256 keeps every sub-allocation at a sector boundary.
+    void* alloc(uint64_t bytes, uint64_t align = 256);
+
+    uint64_t capacity() const { return capacity_; }
+    uint64_t used() const { return used_; }
+    uint64_t peak() const { return used_; }        // no frees, so used IS the peak
+    int ordinal() const { return ordinal_; }
+    void* base() const { return base_; }
+
+private:
+    void* base_ = nullptr;
+    uint64_t capacity_ = 0, used_ = 0;
+    int ordinal_ = 0;
+    bool poison_ = false;
+};
+
+}  // namespace basalt::core

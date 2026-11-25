@@ -1,27 +1,19 @@
-// src/kernels/cpu/expert.cpp - P2.S3: the Q2_0 expert kernel, promoted from bench/micro/cpu_s2.cpp.
+// src/kernels/cpu/expert.cpp - the Q2_0 expert kernel.
 //
-// The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
-// (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
-// include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
-#include "strata/kernels/cpu/expert.hpp"
+// See include/basalt/kernels/cpu/expert.hpp first; it says why each piece is shaped this way.
+#include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <cpuid.h>
-#endif
+#include "basalt/platform/compiler.hpp"
 
 #include <cmath>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "basalt/log.hpp"
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
-
-std::atomic<bool> oracle_q8_0{false};
 
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
 /// subnormals is the one place the two can differ and the scales in this artifact are small.
@@ -49,75 +41,10 @@ inline float h2f(const uint8_t* p) {
     return out;
 }
 
-// The x86 Q8_0 quantization and generic Q2_0 dot sequences are adapted from llama.cpp
-// 3cf03257f219afbe7334045ff7c6a06ac68c627d,
-// ggml/src/ggml-cpu/arch/x86/quants.c: quantize_row_q8_0 and
-// ggml/src/ggml-cpu/quants.c: ggml_vec_dot_q2_0_q8_0_generic.
-//
-// MIT License
-// Copyright (c) 2023-2026 The ggml authors
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
-    a.nchunks = n / QKA;
-    for (int chunk = 0; chunk < a.nchunks; ++chunk) {
-        const float* xb = x + chunk * QKA;
-        __m256 v0 = _mm256_loadu_ps(xb);
-        __m256 v1 = _mm256_loadu_ps(xb + 8);
-        __m256 v2 = _mm256_loadu_ps(xb + 16);
-        __m256 v3 = _mm256_loadu_ps(xb + 24);
-        const __m256 sign = _mm256_set1_ps(-0.0f);
-        __m256 maximum = _mm256_andnot_ps(sign, v0);
-        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v1));
-        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v2));
-        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign, v3));
-        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maximum, 1), _mm256_castps256_ps128(maximum));
-        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
-        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
-        const float amax = _mm_cvtss_f32(max4);
-        const float d = amax / 127.0f;
-        const uint16_t half_d = (uint16_t) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(d), 0));
-        const __m256 inverse = _mm256_set1_ps(amax != 0.0f ? 127.0f / amax : 0.0f);
-        v0 = _mm256_round_ps(_mm256_mul_ps(v0, inverse), _MM_FROUND_TO_NEAREST_INT);
-        v1 = _mm256_round_ps(_mm256_mul_ps(v1, inverse), _MM_FROUND_TO_NEAREST_INT);
-        v2 = _mm256_round_ps(_mm256_mul_ps(v2, inverse), _MM_FROUND_TO_NEAREST_INT);
-        v3 = _mm256_round_ps(_mm256_mul_ps(v3, inverse), _MM_FROUND_TO_NEAREST_INT);
-        __m256i i0 = _mm256_packs_epi32(_mm256_cvtps_epi32(v0), _mm256_cvtps_epi32(v1));
-        const __m256i i2 = _mm256_packs_epi32(_mm256_cvtps_epi32(v2), _mm256_cvtps_epi32(v3));
-        i0 = _mm256_packs_epi16(i0, i2);
-        i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-        int8_t* q = a.q + chunk * QKA;
-        _mm256_storeu_si256((__m256i*) q, i0);
-        int32_t sum = 0;
-        for (int j = 0; j < QKA; ++j) sum += q[j];
-        a.scale[chunk] = h2f((const uint8_t*) &half_d);
-        a.sum[chunk] = sum;
-        a.hx[chunk] = a.scale[chunk] * float(sum);
-    }
-}
-
 /// 2-bit unpack via VPMULTISHIFTQB.
 ///
-/// ARGUMENT ORDER IS (control, data) AND WAS DETERMINED EMPIRICALLY (`bench/micro/probe_multishift.cpp`).
-/// The Intel guide states (a=data, b=control); using that produced 43 of 64 wrong codes.  `plan.md`'s sketch
-/// passes the shift pattern first, which is correct - so a "fix" that swapped it to match the guide was the
-/// bug, not the fix.  Within each 64-bit lane, output byte i is `(u16 >> 2i) & 0xFF`, so AND 3 yields the
+/// ARGUMENT ORDER IS (control, data), determined empirically: the Intel guide states
+/// (a=data, b=control), and following it produces wrong codes.  Within each 64-bit lane, output byte i is `(u16 >> 2i) & 0xFF`, so AND 3 yields the
 /// eight 2-bit codes in order.
 ///
 /// The result is the 32 codes of ONE ACTIVATION CHUNK (4 qword lanes), which is the unit the Q8_1 scale is
@@ -141,16 +68,12 @@ inline float hsum_ps(__m256 v) {
     return _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(s, s), s));
 }
 
-// ================================ plan v0.3 P6: the row dot in 512-bit lanes ================================
+// ================================ the row dot in 512-bit lanes ================================
 //
-// The 256-bit row dot below spent ~12 cycles per 64-weight block: two unpacks, two VNNI dots, two converts, two
-// scalar scale products broadcast into two FMAs, an fp16 conversion and a scalar correction - compute-bound at
-// ~39 GB/s while the machine streams 52.  Here a block is ONE unpack (16 code bytes -> 64 codes), ONE VNNI dot
-// over 64 activations, ONE convert and ONE FMA whose per-chunk scales come from a permute of a vector of scale
-// products built for eight blocks at a time; the weight-independent correction is one FMA per eight blocks.
-// The sum order differs from the 256-bit kernel (last-bit differences); the verify window and plain decode both
-// use this kernel, so speculative decode still reproduces plain decode exactly.
-static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
+// A block is ONE unpack (16 code bytes -> 64 codes), ONE VNNI dot over 64 activations, ONE convert and ONE FMA whose
+// per-chunk scales come from a permute of a vector of scale products built for eight blocks at a time; the
+// weight-independent correction is one FMA per eight blocks.  The verify window and plain decode both use this
+// kernel, so speculative decode reproduces plain decode exactly.
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
@@ -230,46 +153,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
 /// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
 inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    if (kZmm) return row_dot_z(codes, scales, a, nblocks);
-    __m256 acc = _mm256_setzero_ps();
-    // The -sum(xhat) term is a SCALAR: broadcasting it into all 8 lanes and letting hsum_ps add them would
-    // apply it eight times per block.
-    float corr = 0.f;
-    for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256 slo = _mm256_cvtepi32_ps(block_dot(codes + b * 16, a.q + b * QK));
-        const __m256 shi = _mm256_cvtepi32_ps(block_dot(codes + b * 16 + 8, a.q + b * QK + QKA));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b]), slo, acc);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b + 1]), shi, acc);
-        corr += d * (a.hx[2 * b] + a.hx[2 * b + 1]);
-    }
-    return hsum_ps(acc) - corr;
-}
-
-// VNNI's integer partial sums are exact. Remove the Q2_0 code offset BEFORE
-// conversion to float, then follow the pinned generic CPU dot's two-chunk and
-// per-64-block reduction. Its x86 type trait selects this generic reduction even
-// in the AVX-512 oracle build. The legacy eight-lane FP32 reduction above has a
-// different rounding order and remains the default.
-inline int chunk_dot_oracle(const uint8_t* codes, const int8_t* q, int sum) {
-    const __m256i lanes = block_dot(codes, q);
-    const __m128i halves = _mm_add_epi32(_mm256_castsi256_si128(lanes), _mm256_extracti128_si256(lanes, 1));
-    const __m128i pairs = _mm_hadd_epi32(halves, halves);
-    return _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs)) - sum;
-}
-
-inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    float result = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
-        float block = 0.0f;
-        for (int half = 0; half < 2; ++half) {
-            const int chunk = 2 * b + half;
-            const int dot = chunk_dot_oracle(codes + b * 16 + half * 8, a.q + chunk * QKA, a.sum[chunk]);
-            block += a.scale[chunk] * float(dot);
-        }
-        result += h2f(scales + 2 * b) * block;
-    }
-    return result;
+    return row_dot_z(codes, scales, a, nblocks);
 }
 
 /// `row_dot` for NT activations at once: the codes of each block are unpacked once, and each token's
@@ -277,63 +161,7 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
 template<int NT>
 inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
                           float* res) {
-    if (kZmm) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res); return; }
-    __m256 acc[NT];
-    float corr[NT];
-    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
-    for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256i lo = unpack_q2_0(codes + b * 16);
-        const __m256i hi = unpack_q2_0(codes + b * 16 + 8);
-        for (int t = 0; t < NT; ++t) {
-            const __m256 slo = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, _mm256_load_si256((const __m256i*) (a[t]->q + b * QK))));
-            const __m256 shi = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi,
-                                    _mm256_load_si256((const __m256i*) (a[t]->q + b * QK + QKA))));
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), slo, acc[t]);
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), shi, acc[t]);
-            corr[t] += d * (a[t]->hx[2 * b] + a[t]->hx[2 * b + 1]);
-        }
-    }
-    for (int t = 0; t < NT; ++t) res[t] = hsum_ps(acc[t]) - corr[t];
-}
-
-template<int NT>
-void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out, ExpertScratchMulti& ws) {
-    float g[NT], u[NT];
-    for (int r = 0; r < FF; ++r) {
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
-        for (int t = 0; t < NT; ++t) ws.ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-    const ActQ* a2[NT];
-    for (int t = 0; t < NT; ++t) {
-        act_quant_q8_1(ws.ff[t], FF, ws.a2[t]);
-        a2[t] = &ws.a2[t];
-    }
-    float o[NT];
-    for (int r = 0; r < H; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
-        for (int t = 0; t < NT; ++t) out[t][r] = o[t];
-    }
-}
-
-void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    for (int r = 0; r < FF; ++r) {
-        const float g = row_dot_oracle(blob + O_GU_CODES + size_t(2 * r) * ROW_GU,
-                                      blob + O_GU_SCALES + size_t(2 * r) * SC_GU * 2, a1, SC_GU);
-        const float u = row_dot_oracle(blob + O_GU_CODES + size_t(2 * r + 1) * ROW_GU,
-                                      blob + O_GU_SCALES + size_t(2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-    quantize_oracle_q8_0(ws.ff, FF, ws.a2);
-    for (int r = 0; r < H; ++r)
-        out[r] = row_dot_oracle(blob + O_D_CODES + size_t(r) * ROW_D,
-                               blob + O_D_SCALES + size_t(r) * SC_D * 2, ws.a2, SC_D);
+    row_dot_multi_z<NT>(codes, scales, a, nblocks, res);
 }
 
 }  // namespace
@@ -352,17 +180,11 @@ const char* CpuFeatures::reason() const {
 CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
-    __cpuid(reg, 0);
-    if (reg[0] < 7) return f;
-    __cpuidex(reg, 7, 0);
-#else
     unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    platform::cpuid(0, 0, r);
     if (r[0] < 7) return f;
-    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+    platform::cpuid(7, 0, r);
     for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
-#endif
     const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
     f.avx512f = (ebx >> 16) & 1u;
     f.avx512bw = (ebx >> 30) & 1u;
@@ -372,26 +194,11 @@ CpuFeatures cpu_features() {
     return f;
 }
 
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
-                 f.reason());
-    std::exit(1);
-}
-
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
-    if (oracle_q8_0.load(std::memory_order_relaxed)) {
-        quantize_oracle_q8_0(x, n, a);
-        return;
-    }
     a.nchunks = n / QKA;
-    // Plan v0.3 P6: AVX-512, the same operations per element as the scalar loop below (max of |x|, one multiply,
-    // +-0.5 away from zero, truncation, clamp), so the result is bitwise the scalar one.  The scalar loop took
-    // ~22 us per 2560 values - 3.2 ms of every speculative round.
+    // AVX-512, the same operations per element as the scalar loop below (max of |x|, one multiply,
+    // +-0.5 away from zero, truncation, clamp), so the result is bitwise the scalar one.  The scalar loop is a
+    // visible cost per speculative round.
     {
         const __m512 half = _mm512_set1_ps(0.5f), mhalf = _mm512_set1_ps(-0.5f), zero = _mm512_setzero_ps();
         const __m512i lo = _mm512_set1_epi32(-127), hi = _mm512_set1_epi32(127);
@@ -427,11 +234,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         int32_t sum = 0;
         int8_t* q = a.q + k * QKA;
         for (int j = 0; j < QKA; ++j) {
-            // **`std::lround` IS A FUNCTION CALL AND IT COST 51 us PER LAYER.**  Measured: quantizing 2560
-            // floats took 51.3 us - 20 ns per element, about 60 cycles for a fabs, a multiply and a round.
-            // `lround` respects the current rounding mode, so MSVC cannot inline it to a single instruction
-            // and emits a call per element.  48 layers x 51.3 us = 2.46 ms/token, which is 8.6% of the whole
-            // CPU expert term and is pure overhead.
+            // **`std::lround` IS A FUNCTION CALL.**  It respects the current rounding mode, so a compiler may not inline it
+            // to a single instruction and emits a call per element, which is pure overhead on the CPU expert path.
             //
             // `t + copysign(0.5, t)` is EXACTLY `lround`'s rule - round half AWAY FROM ZERO - and it is
             // branchless and vectorizable.  It is NOT `_mm256_round_ps`, which rounds half to EVEN and would
@@ -450,104 +254,10 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
-void expert_set_oracle_q8_0(bool enabled) {
-    oracle_q8_0.store(enabled, std::memory_order_relaxed);
-}
-
-void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
-    act_quant_q8_1(x, H, ws.a1);
-    s2_expert_vnni_q(blob, ws.a1, out, ws);
-}
-
-void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    if (oracle_q8_0.load(std::memory_order_relaxed)) {
-        expert_oracle_q8_0(blob, a1, out, ws);
-        return;
-    }
-    for (int r = 0; r < FF; ++r) {
-        const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
-        const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        // SiLU on the GATE, multiplied by up - the same reading `docs/semantics.md` records for the shared
-        // expert, and the one that is wrong the other way round in a way that still produces a number.
-        ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-    act_quant_q8_1(ws.ff, FF, ws.a2);
-    for (int r = 0; r < H; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D,
-                         blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
-}
-
-bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
-
-void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-        const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
-        const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-}
-
-void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
-    for (int r = r0; r < r1; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D);
-}
-
 namespace {
-template<int NT>
-void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff, int r0, int r1) {
-    float g[NT], u[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
-        row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-}
-template<int NT>
-void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* out, int r0, int r1) {
-    float o[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
-        for (int t = 0; t < NT; ++t) out[t][r] = o[t];
-    }
-}
 }  // namespace
 
-void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
-                             int r1) {
-    switch (n_tokens) {
-        case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
-        case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
-        case 3: gu_rows_multi<3>(blob, a1, ff, r0, r1); break;
-        case 4: gu_rows_multi<4>(blob, a1, ff, r0, r1); break;
-        case 5: gu_rows_multi<5>(blob, a1, ff, r0, r1); break;
-        case 6: gu_rows_multi<6>(blob, a1, ff, r0, r1); break;
-        case 7: gu_rows_multi<7>(blob, a1, ff, r0, r1); break;
-        default: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
-    }
-}
-
-void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
-                               int r1) {
-    switch (n_tokens) {
-        case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
-        case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
-        case 3: down_rows_multi<3>(blob, a2, out, r0, r1); break;
-        case 4: down_rows_multi<4>(blob, a2, out, r0, r1); break;
-        case 5: down_rows_multi<5>(blob, a2, out, r0, r1); break;
-        case 6: down_rows_multi<6>(blob, a2, out, r0, r1); break;
-        case 7: down_rows_multi<7>(blob, a2, out, r0, r1); break;
-        default: down_rows_multi<8>(blob, a2, out, r0, r1); break;
-    }
-}
-
-// ================================ plan v0.3 P6: Q2_0 rows in the GGUF block layout ================================
+// ================================ Q2_0 rows in the GGUF block layout ================================
 //
 // The IQ model files keep their down projections in Q2_0 GGUF blocks (fp16 d, then 16 code bytes: 18 bytes per
 // 64 weights, interleaved), which ggml-cpu computes with a scalar loop on x86.  This is `row_dot_multi_z` with
@@ -608,76 +318,4 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
     }
 }
 
-void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
-                          ExpertScratchMulti& ws) {
-    if (oracle_q8_0.load(std::memory_order_relaxed) || n_tokens < 1 || n_tokens > MAXT) {
-        for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
-        return;
-    }
-    switch (n_tokens) {
-        case 1: expert_multi<1>(blob, a1, out, ws); break;
-        case 2: expert_multi<2>(blob, a1, out, ws); break;
-        case 3: expert_multi<3>(blob, a1, out, ws); break;
-        case 4: expert_multi<4>(blob, a1, out, ws); break;
-        case 5: expert_multi<5>(blob, a1, out, ws); break;
-        case 6: expert_multi<6>(blob, a1, out, ws); break;
-        case 7: expert_multi<7>(blob, a1, out, ws); break;
-        default: expert_multi<8>(blob, a1, out, ws); break;
-    }
-}
-
-void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool quant_acts) {
-    // BOTH STAGES, which is what `quant_acts` promises and what `bench/micro/cpu_s2.cpp` does NOT do.
-    //
-    // The original's comment says the oracle "consume[s] the SAME INT8 activation values the VNNI path uses,
-    // at both stages", but its code quantizes only the INTERMEDIATE - the gate/up projections still see raw
-    // f32 `x`.  Feeding it an already-quantized input (which is what the engine does) makes the two coincide
-    // and hides the discrepancy entirely; feeding it a raw f32 input makes the comparison one between two
-    // DIFFERENT computations, and the gap measured here was 1.19e-02 - three times P2.S3's tolerance, and
-    // read as a kernel bug when it was a fixture bug.
-    float xq[H];
-    const float* x = x_in;
-    if (quant_acts) {
-        ActQ a1;
-        act_quant_q8_1(x_in, H, a1);
-        for (int i = 0; i < H; ++i) xq[i] = a1.scale[i / QKA] * (float) a1.q[i];
-        x = xq;
-    }
-    float ff[FF];
-    for (int r = 0; r < FF; ++r) {
-        const uint8_t* gc = blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU;
-        const uint8_t* gs = blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2;
-        const uint8_t* uc = blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU;
-        const uint8_t* us = blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2;
-        float sg = 0.f, su = 0.f;
-        for (int b = 0; b < SC_GU; ++b) {
-            const float dg = h2f(gs + 2 * b), du = h2f(us + 2 * b);
-            for (int j = 0; j < QK; ++j) {
-                const int o = b * QK + j;
-                sg += (float) (((gc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * dg * x[o];
-                su += (float) (((uc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * du * x[o];
-            }
-        }
-        ff[r] = (sg / (1.f + std::exp(-sg))) * su;
-    }
-    if (quant_acts) {
-        // Replace the exact intermediate with the INT8 values the VNNI path actually sees, so the two differ
-        // only by FP32 evaluation order.
-        ActQ a2;
-        act_quant_q8_1(ff, FF, a2);
-        for (int i = 0; i < FF; ++i) ff[i] = a2.scale[i / QKA] * (float) a2.q[i];
-    }
-    for (int r = 0; r < H; ++r) {
-        const uint8_t* dc = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* ds = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        float acc = 0.f;
-        for (int b = 0; b < SC_D; ++b) {
-            const float d = h2f(ds + 2 * b);
-            for (int j = 0; j < QK; ++j)
-                acc += (float) (((dc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d * ff[b * QK + j];
-        }
-        out[r] = acc;
-    }
-}
-
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

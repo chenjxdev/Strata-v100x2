@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lapilli</title>
+<meta name="description" content="Lapilli: chat with a language model running on your own NVIDIA V100 GPUs">
+<!-- Lapilli: the chat page of the port of Basalt (jesdga95, MIT license) to NVIDIA V100 GPUs.
+     Its interface follows the spirit of Strata's (Niko1221, MIT license); text is formatted by marked (MIT license). -->
+<link rel="icon" type="image/svg+xml" href="web/lapilli-logo.svg">
+<link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="web/lapilli.css">
+<script>
+  // the theme before the first paint: the saved choice, otherwise the system's
+  try {
+    const t = localStorage.getItem("lapilli.theme");
+    document.documentElement.dataset.theme = t === "dark" || t === "light" ? t :
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  } catch (e) {
+    document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+</script>
+<script defer src="web/marked.umd.js"></script>
+<script defer src="web/lapilli-monitor.js"></script>
+<script defer src="web/lapilli.js"></script>
+</head>
+<body>
+<header class="entete">
+  <button class="btn btn--icone entete__panneau" id="btn-panneau" type="button" title="Show or hide conversations"
+          aria-label="Show or hide conversations" aria-controls="convs" aria-expanded="true">
+    <svg class="ic"><use href="web/lapilli-icons.svg#i-panneau"/></svg></button>
+  <a class="marque" href="#" id="marque" aria-label="Lapilli, go to chat">
+    <img src="web/lapilli-logo.svg" alt="" width="28" height="28"><span>Lapilli</span></a>
+  <nav class="onglets" role="tablist" aria-label="Views">
+    <button class="onglet" role="tab" id="onglet-discussion" data-vue="discussion" aria-controls="vue-discussion" aria-selected="true">
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-discussion"/></svg><span>Chat</span></button>
+    <button class="onglet" role="tab" id="onglet-moniteur" data-vue="moniteur" aria-controls="vue-moniteur" aria-selected="false">
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-moniteur"/></svg><span>Monitor</span></button>
+    <button class="onglet" role="tab" id="onglet-experts" data-vue="experts" aria-controls="vue-experts" aria-selected="false" hidden>
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-experts"/></svg><span>Experts</span></button>
+    <button class="onglet" role="tab" id="onglet-apropos" data-vue="apropos" aria-controls="vue-apropos" aria-selected="false">
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-info"/></svg><span>About</span></button>
+  </nav>
+  <span class="entete__espace"></span>
+  <span class="pastille" id="pastille" data-etat="connexion" role="status" aria-live="polite">
+    <span class="pastille__point"></span><span class="pastille__texte" id="pastille-texte">Connecting…</span></span>
+  <button class="btn btn--icone" id="btn-theme" type="button" title="Light or dark theme" aria-label="Switch between light and dark theme">
+    <svg class="ic"><use id="ic-theme" href="web/lapilli-icons.svg#i-lune"/></svg></button>
+</header>
+
+<main class="corps">
+  <!-- ================================ Chat ================================ -->
+  <section class="vue vue--discussion" id="vue-discussion" role="tabpanel" aria-labelledby="onglet-discussion">
+    <aside class="convs" id="convs" aria-label="Conversations" data-ouvert="true">
+      <div class="convs__tete">
+        <span class="convs__titre">Conversations</span>
+        <button class="btn btn--doux btn--petit" id="btn-nouvelle" type="button" title="Start a new conversation">
+          <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-nouveau"/></svg>New</button>
+      </div>
+      <div class="convs__liste" id="convs-liste"></div>
+      <p class="convs__note">Saved in this browser only.</p>
+    </aside>
+    <div class="voile voile--convs" id="voile-convs" hidden></div>
+
+    <div class="fil-col">
+      <div class="fil-defile" id="fil-defile">
+        <div class="fil" id="fil">
+          <div class="accueil" id="accueil">
+            <img class="accueil__marque" src="web/lapilli-logo.svg" alt="" width="64" height="64">
+            <h1 class="accueil__titre">Hello, what would you like to talk about?</h1>
+            <p class="accueil__sous" id="accueil-sous">Lapilli runs on your own GPUs. Nothing leaves your machine.</p>
+            <div class="suggestions" id="suggestions">
+              <button type="button" class="suggestion" data-q="Explain in simple terms how a volcano works, with a small table of eruption types.">
+                <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-reflexion"/></svg><span>How does a volcano work?</span></button>
+              <button type="button" class="suggestion" data-q="Write a Python function that computes the mean and the median of a list, with examples.">
+                <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-fichier"/></svg><span>A commented Python function</span></button>
+              <button type="button" class="suggestion" data-q="Suggest a simple, balanced weekly menu, as a table.">
+                <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-couches"/></svg><span>A weekly menu</span></button>
+              <button type="button" class="suggestion" data-q="Sum up in five points what you need to know to take good care of a car.">
+                <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-succes"/></svg><span>Five quick tips</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button class="vers-bas" id="vers-bas" type="button" title="Scroll to the end of the conversation" aria-label="Scroll to the end of the conversation" hidden>
+        <svg class="ic"><use href="web/lapilli-icons.svg#i-bas"/></svg></button>
+
+      <div class="saisie-zone">
+        <form class="saisie" id="saisie-form" autocomplete="off">
+          <div class="pieces" id="pieces" hidden></div>
+          <textarea id="saisie" rows="1" placeholder="Type a message…" aria-label="Your message"></textarea>
+          <div class="saisie__barre">
+            <button type="button" class="btn btn--icone" id="btn-joindre" title="Attach a text file (or drop it here)" aria-label="Attach a text file">
+              <svg class="ic"><use href="web/lapilli-icons.svg#i-joindre"/></svg></button>
+            <input type="file" id="fichiers" multiple hidden>
+            <button type="button" class="btn btn--icone" id="btn-nouvelle-2" title="New conversation" aria-label="New conversation">
+              <svg class="ic"><use href="web/lapilli-icons.svg#i-nouveau"/></svg></button>
+            <button type="button" class="btn btn--icone" id="btn-exporter" title="Save the conversation (Markdown)" aria-label="Save the conversation">
+              <svg class="ic"><use href="web/lapilli-icons.svg#i-exporter"/></svg></button>
+            <button type="button" class="reglage-puce" id="btn-reglages" title="Response settings" aria-label="Response settings">
+              <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-reglages"/></svg><span id="reglage-resume">Medium thinking</span></button>
+            <span class="saisie__espace"></span>
+            <span class="saisie__aide" id="saisie-aide">Shift+Enter: new line</span>
+            <button type="button" class="btn btn--doux" id="btn-arreter" title="Stop the response" aria-label="Stop the response" hidden>
+              <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-arreter"/></svg><span class="btn__texte">Stop</span></button>
+            <button type="submit" class="btn btn--accent btn--envoyer" id="btn-envoyer" title="Send (Enter)" aria-label="Send">
+              <svg class="ic"><use href="web/lapilli-icons.svg#i-envoyer"/></svg></button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================ Monitor ================================ -->
+  <section class="vue vue--defile" id="vue-moniteur" role="tabpanel" aria-labelledby="onglet-moniteur" hidden>
+    <div class="moniteur">
+      <div class="sous-onglets" id="sous-onglets" role="tablist" aria-label="Monitor sections">
+        <button class="sous-onglet" role="tab" type="button" id="so-apercu" data-sous="apercu" aria-controls="sv-apercu" aria-selected="true">Overview</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-requetes" data-sous="requetes" aria-controls="sv-requetes" aria-selected="false">Requests</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-creneaux" data-sous="creneaux" aria-controls="sv-creneaux" aria-selected="false">Slots</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-materiel" data-sous="materiel" aria-controls="sv-materiel" aria-selected="false">Hardware</button>
+        <button class="sous-onglet" role="tab" type="button" id="so-journal" data-sous="journal" aria-controls="sv-journal" aria-selected="false">Logs</button>
+      </div>
+
+      <!-- Overview -->
+      <div class="sous-vue" id="sv-apercu" role="tabpanel" aria-labelledby="so-apercu">
+        <div class="carte etat-carte">
+          <div class="etat-carte__haut">
+            <div class="etat-carte__titre">
+              <span class="carte__titre">Model status</span>
+              <span class="etat-carte__libelle" id="etat-libelle">Waiting for a question</span>
+            </div>
+            <span class="badges" id="etat-badges">
+              <span class="badge" data-b="repos">Idle</span>
+              <span class="badge badge--lecture" data-b="lecture">Reading</span>
+              <span class="badge badge--reflexion" data-b="reflexion">Thinking</span>
+              <span class="badge badge--ecriture" data-b="ecriture">Writing</span>
+              <span class="badge badge--attente" data-b="attente">Waiting</span>
+            </span>
+          </div>
+          <div class="etat-carte__detail" id="etat-detail">&nbsp;</div>
+          <div class="barre" id="etat-barre"><div class="barre__plein" id="etat-plein"></div></div>
+        </div>
+
+        <div class="vitesses">
+          <div class="carte vitesse-carte">
+            <div class="carte__tete"><span class="carte__titre">Writing</span><span class="doux petit" id="vc-ecr-note"></span></div>
+            <div class="vitesse__chiffre"><span class="vitesse__valeur" id="vv-ecr">–</span><span class="vitesse__unite" id="vu-ecr">tokens/s</span></div>
+            <div class="vitesse__sous" id="vs-ecr"></div>
+            <div class="graphe" id="g-ecr"></div>
+          </div>
+          <div class="carte vitesse-carte">
+            <div class="carte__tete"><span class="carte__titre">Reading</span><span class="doux petit" id="vc-lec-note"></span></div>
+            <div class="vitesse__chiffre"><span class="vitesse__valeur vitesse__valeur--lecture" id="vv-lec">–</span><span class="vitesse__unite" id="vu-lec">tokens/s</span></div>
+            <div class="vitesse__sous" id="vs-lec"></div>
+            <div class="graphe" id="g-lec"></div>
+          </div>
+        </div>
+
+        <div class="tuiles" id="tuiles"></div>
+
+        <div class="apercu__rang">
+          <div class="carte contexte-carte">
+            <span class="carte__titre">Context</span>
+            <div class="jauge-bloc">
+              <svg class="jauge" viewBox="0 0 120 120" aria-hidden="true">
+                <circle class="jauge__piste" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                        stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+                <circle class="jauge__plein" id="ctx-plein" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                        stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+              </svg>
+              <div class="jauge__texte"><span class="jauge__pct" id="ctx-pct">0%</span><span class="doux" id="ctx-sous">–</span></div>
+            </div>
+            <dl class="liste-faits" id="cache-faits"></dl>
+          </div>
+          <div class="carte derniere-carte">
+            <div class="carte__tete"><span class="carte__titre">Last response</span><span class="doux petit" id="derniere-quand"></span></div>
+            <dl class="liste-faits" id="derniere-faits"></dl>
+            <div class="ligne-barre"><span>Where its experts ran</span><span class="doux" id="derniere-part-note"></span></div>
+            <div class="repartition" id="repartition" aria-hidden="true"></div>
+            <div class="repartition-legende" id="repartition-legende"></div>
+          </div>
+          <div class="carte records-carte">
+            <div class="carte__tete"><span class="carte__titre">Records and totals</span><span class="doux petit" id="totaux-depuis"></span></div>
+            <div class="records" id="records"></div>
+            <dl class="liste-faits" id="totaux-faits"></dl>
+          </div>
+        </div>
+      </div>
+
+      <!-- Requests -->
+      <div class="sous-vue" id="sv-requetes" role="tabpanel" aria-labelledby="so-requetes" hidden>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Waiting for a slot</span><span class="doux petit" id="attente-nombre"></span></div>
+          <div class="file-attente" id="file-attente"></div>
+        </div>
+        <div class="carte requetes-carte">
+          <div class="carte__tete"><span class="carte__titre">Recent responses</span><span class="doux petit" id="requetes-nombre"></span></div>
+          <div class="table-defile">
+            <table class="table table-requetes" id="table-requetes">
+              <thead><tr><th>Time</th><th class="c-num" title="The response's number since the server started">#</th><th class="c-creneau">Slot</th>
+                <th class="c-point">Endpoint</th><th>Finish</th>
+                <th class="num c-msg" title="Tokens of the message read by the model">Message</th>
+                <th class="num c-reut" title="Tokens reused from the cache: they were not read again">Reused</th><th class="num c-ecrit">Written</th>
+                <th class="num c-lec" title="Tokens read per second, for a message of at least 256 tokens (reused tokens excluded)">Reading</th>
+                <th class="num" title="Tokens written per second">Writing</th>
+                <th class="num c-pj" title="Time to the first written token">First token</th><th class="num c-duree">Duration</th></tr></thead>
+              <tbody id="requetes-corps"><tr><td colspan="12" class="doux">No responses yet</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Tokens per response</span><span class="legende" id="jetons-legende"></span></div>
+          <div class="colonnes" id="g-jetons"></div>
+        </div>
+      </div>
+
+      <!-- Slots -->
+      <div class="sous-vue" id="sv-creneaux" role="tabpanel" aria-labelledby="so-creneaux" hidden>
+        <div class="creneaux" id="creneaux"><div class="carte vide doux">Reading the slots…</div></div>
+      </div>
+
+      <!-- Hardware -->
+      <div class="sous-vue" id="sv-materiel" role="tabpanel" aria-labelledby="so-materiel" hidden>
+        <div class="materiel" id="materiel-cartes"></div>
+        <div class="materiel-machine" id="materiel-machine"></div>
+        <p class="doux petit materiel__pied" id="materiel-pied"></p>
+      </div>
+
+      <!-- Logs -->
+      <div class="sous-vue" id="sv-journal" role="tabpanel" aria-labelledby="so-journal" hidden>
+        <div class="carte journal-carte">
+          <div class="journal__barre">
+            <div class="segments segments--petit" id="journal-filtre" role="radiogroup" aria-label="Lines shown">
+              <button type="button" role="radio" data-v="tout" aria-checked="true">All</button><button type="button" role="radio" data-v="alertes" aria-checked="false">Warnings and errors</button>
+            </div>
+            <span class="doux petit" id="journal-nombre"></span>
+            <span class="journal__espace"></span>
+            <div class="bascule-ligne bascule-ligne--petit"><span>Follow</span>
+              <button class="bascule" id="journal-suivre" type="button" role="switch" aria-checked="true" aria-label="Follow the newest lines"></button></div>
+          </div>
+          <div class="journal" id="journal" role="log" aria-label="Server and engine log" tabindex="0"></div>
+          <button class="btn btn--doux btn--petit journal__dernier" id="journal-dernier" type="button" hidden>
+            <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-bas"/></svg>Jump to latest</button>
+        </div>
+      </div>
+
+      <p class="moniteur__pied doux petit"><span>Updated every second from the Lapilli server.</span>
+        <a href="dashboard" target="_blank" rel="noopener" class="lien-externe">Basalt's detailed dashboard<svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-externe"/></svg></a></p>
+    </div>
+  </section>
+
+  <!-- ================================ Experts ================================ -->
+  <section class="vue vue--defile" id="vue-experts" role="tabpanel" aria-labelledby="onglet-experts" hidden>
+    <div class="moniteur experts">
+      <div class="carte experts-tete">
+        <div class="experts-tete__haut">
+          <div class="experts-tete__titre"><span class="carte__titre">Experts</span><p class="doux" id="ex-resume">&nbsp;</p></div>
+          <span class="badge" id="ex-etat"></span>
+        </div>
+        <div class="kpis" id="ex-kpis"></div>
+      </div>
+
+      <div class="carte ex-carte-carte">
+        <div class="carte__tete">
+          <span class="carte__titre">Expert map</span>
+          <div class="segments segments--petit" id="ex-mode" role="radiogroup" aria-label="What the colors show">
+            <button type="button" role="radio" data-v="vivant" aria-checked="true">Live</button><button type="button" role="radio" data-v="place" aria-checked="false">Placement</button><button type="button" role="radio" data-v="activite" aria-checked="false">Activity</button>
+          </div>
+        </div>
+        <div class="ex-legende" id="ex-legende"></div>
+        <div class="ex-carte" id="ex-carte"><canvas id="ex-canevas"></canvas></div>
+        <p class="doux petit ex-note" id="ex-note"></p>
+      </div>
+
+      <div class="experts__rang">
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Lookups per second</span><span class="doux petit" id="ex-flux-note"></span></div>
+          <div class="legende" id="ex-flux-legende"></div>
+          <div class="graphe" id="g-experts"></div>
+        </div>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Where the experts are kept</span><span class="doux petit" id="ex-occ-note"></span></div>
+          <div class="occupation" id="ex-occupation"></div>
+        </div>
+      </div>
+
+      <div class="carte">
+        <div class="carte__tete"><span class="carte__titre">By layer</span><span class="doux petit" id="ex-couches-note"></span></div>
+        <div class="legende" id="ex-couches-legende"></div>
+        <div class="couches" id="ex-couches"></div>
+      </div>
+
+      <div class="experts__rang">
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Busiest experts</span><span class="doux petit" id="ex-top-note"></span></div>
+          <div class="table-defile">
+            <table class="table">
+              <thead><tr><th>Layer</th><th>Expert</th><th>Kept on</th><th class="num" title="Lookups per second, over the last second">Now</th>
+                <th class="num" title="Recent lookups, fading by 15% a second">Recent</th></tr></thead>
+              <tbody id="ex-top"><tr><td colspan="5" class="doux">No lookups yet</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="carte ex-aide">
+          <span class="carte__titre">How to read this page</span>
+          <div class="ex-aide__corps" id="ex-aide"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================ About ================================ -->
+  <section class="vue vue--defile" id="vue-apropos" role="tabpanel" aria-labelledby="onglet-apropos" hidden>
+    <div class="apropos">
+      <div class="carte">
+        <span class="carte__titre">Model and engine</span>
+        <dl class="faits" id="faits-moteur"></dl>
+      </div>
+      <div class="carte">
+        <span class="carte__titre">Hardware</span>
+        <dl class="faits" id="faits-machine"></dl>
+      </div>
+      <div class="carte">
+        <span class="carte__titre">Connect your tools</span>
+        <p class="doux">Any OpenAI- or Anthropic-compatible client works with these URLs.</p>
+        <dl class="faits" id="faits-api"></dl>
+      </div>
+      <div class="carte">
+        <span class="carte__titre">Page settings</span>
+        <div class="bascule-ligne"><span>Dark theme</span>
+          <button class="bascule" id="bascule-sombre" type="button" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
+        <div class="champ" id="champ-cle" hidden>
+          <label class="champ__libelle" for="cle-api">API key <output>the server requires one</output></label>
+          <input class="entree" id="cle-api" type="password" autocomplete="off" placeholder="Paste the key here">
+        </div>
+        <p class="doux petit">Conversations, settings and the key stay in this browser.</p>
+      </div>
+      <div class="carte">
+        <span class="carte__titre">Credits</span>
+        <p class="credits">Lapilli is a port of <a href="https://github.com/jesdga95/basalt" target="_blank" rel="noopener noreferrer">Basalt</a>
+          (by jesdga95, MIT license) to NVIDIA V100 (Volta) GPUs. Its interface follows the spirit of
+          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata</a>'s (by Niko1221, MIT license).
+          Text is formatted by <a href="https://github.com/markedjs/marked" target="_blank" rel="noopener noreferrer">marked</a>
+          (MIT license); the font is Geist (SIL Open Font License).</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ================================ Response settings ================================ -->
+<aside class="tiroir" id="tiroir" data-ouvert="false" aria-label="Response settings" aria-hidden="true">
+  <div class="tiroir__tete"><span class="carte__titre">Response settings</span>
+    <button class="btn btn--icone" id="tiroir-fermer" type="button" aria-label="Close settings" title="Close">
+      <svg class="ic"><use href="web/lapilli-icons.svg#i-croix"/></svg></button></div>
+  <div class="tiroir__corps">
+    <div class="champ">
+      <span class="champ__libelle" id="lib-reflexion">Thinking <output id="o-reflexion"></output></span>
+      <div class="segments" id="r-reflexion" role="radiogroup" aria-labelledby="lib-reflexion">
+        <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Short</button>
+        <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">Long</button>
+      </div>
+    </div>
+    <div class="champ">
+      <label class="champ__libelle" for="r-longueur">Maximum length <output>thinking included</output></label>
+      <select class="entree" id="r-longueur">
+        <option value="1024">1,024 tokens</option><option value="2048">2,048 tokens</option><option value="4096">4,096 tokens</option>
+        <option value="8192">8,192 tokens</option><option value="16384">16,384 tokens</option><option value="32768">32,768 tokens</option>
+        <option value="0">No limit</option>
+      </select>
+      <span class="doux petit" id="r-contexte" hidden></span>
+    </div>
+    <div class="bascule-ligne"><span>Show thinking<br><span class="doux petit">open while it is being written</span></span>
+      <button class="bascule" id="r-montrer" type="button" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
+    <details class="avance" id="r-avance">
+      <summary><span>Advanced settings</span><svg class="ic ic--p chevron"><use href="web/lapilli-icons.svg#i-chevron"/></svg></summary>
+      <div class="avance__corps">
+        <div class="champ">
+          <label class="champ__libelle" for="r-temperature">Temperature <output id="o-temperature"></output></label>
+          <input class="curseur" type="range" id="r-temperature" min="0" max="2" step="0.05">
+          <span class="doux petit">0: always the most likely word (repeatable responses)</span>
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-topp">Top-p <output id="o-topp"></output></label>
+          <input class="curseur" type="range" id="r-topp" min="0.05" max="1" step="0.05">
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-topk">Top-k <output id="o-topk"></output></label>
+          <input class="curseur" type="range" id="r-topk" min="1" max="100" step="1">
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-graine">Seed <output>empty: random</output></label>
+          <input class="entree" id="r-graine" type="number" min="0" step="1" placeholder="Random">
+        </div>
+        <p class="doux petit" id="r-defauts"></p>
+      </div>
+    </details>
+    <div class="tiroir__pied">
+      <button class="btn btn--doux" id="r-retablir" type="button">
+        <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-regenerer"/></svg>Reset</button>
+      <span class="doux petit" id="r-note" role="status">Saved in this browser.</span>
+    </div>
+  </div>
+</aside>
+<div class="voile" id="voile" hidden></div>
+<div class="annonces" id="annonces" aria-live="polite"></div>
+<noscript><p class="sans-js">This page needs JavaScript.</p></noscript>
+</body>
+</html>

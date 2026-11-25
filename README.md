@@ -1,313 +1,297 @@
-<h1 align="center">Qwen3.8-Flash-Next (125B MoE) on a 12-24 GB NVIDIA GPU + 64 GB RAM: one-click install for Windows / Linux</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/lapilli-banner-dark.png">
+    <img src="docs/img/lapilli-banner-light.png" alt="Lapilli: Basalt on NVIDIA V100 GPUs. Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash Coder, Qwen3.8-27B" width="100%">
+  </picture>
+</p>
 
-<p align="center"><b>Strata</b>: an inference engine built for exactly one model and exactly this kind of PC</p>
+<p align="center">
+  <a href="https://github.com/chris83-dev/lapilli-v100/releases"><img src="https://img.shields.io/github/v/release/chris83-dev/lapilli-v100?label=release&color=c2410c" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/GPU-NVIDIA%20V100%20%C2%B7%20sm__70-76b900" alt="GPU: NVIDIA V100, sm_70">
+  <img src="https://img.shields.io/badge/CUDA-12.6%20to%2012.9-0b6bcb" alt="CUDA 12.6 to 12.9">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-57534e" alt="Platforms: Windows and Linux">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-57534e" alt="License: MIT"></a>
+</p>
 
-A 125-billion-parameter mixture-of-experts model (6B active per token) on a **normal gaming PC**: one NVIDIA card with
-12-24 GB of VRAM, 64 GB of RAM and a desktop CPU. Strata keeps the always-used part of the model on the GPU, all 24,576
-experts in RAM, computes the experts the GPU does not hold on the CPU at the same time, and checks several tokens per
-pass with the model's own multi-token-prediction (MTP) layer. The text it produces is identical to plain greedy decoding.
+<p align="center">
+  <b>Your V100 isn't done yet.</b><br>
+  A port of <a href="https://github.com/jesdga95/basalt">Basalt</a> to Volta (compute capability 7.0), with a chat page and a live monitor.
+</p>
 
-It serves an **OpenAI-** and **Anthropic-compatible API on localhost**, so any chat app, coding agent or script that
-talks to those APIs can use it. Optionally it also **reads images** (screenshots, photos, scanned pages) with the
-model's own vision encoder.
+<p align="center">
+  <a href="#the-three-models">Models</a> ·
+  <a href="#recommended-models">Downloads</a> ·
+  <a href="#whats-new-in-v05">What's new</a> ·
+  <a href="#tested-by-the-community">Community</a> ·
+  <a href="#quick-start-windows">Quick start</a> ·
+  <a href="#build">Build</a> ·
+  <a href="README.fr.md">Français</a>
+</p>
 
-> **Jump to:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
-> [Windows](#windows) · [Linux](#linux) · [Using it](#using-it) · [Images](#images-vision) ·
-> [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
+Upstream Basalt targets Blackwell (sm_120) only. Lapilli adds sm_70 and keeps the Blackwell build as it was. One
+`basalt.exe` runs all three of Basalt's models on V100 cards; the server keeps Basalt's OpenAI and Anthropic APIs and serves
+the Lapilli chat page at `/` (Basalt's dashboard moves to `/dashboard`).
 
----
+*Lapilli are the small fragments a volcano throws out: small pieces of basalt.*
 
-## Speed (measured)
+<p align="center"><img src="docs/img/lapilli-chat.png" alt="The Lapilli chat page: a question, the collapsed reasoning and the formatted answer" width="860"></p>
+<p align="center"><img src="docs/img/lapilli-monitor.png" alt="The Monitor while an answer is written: decode speed, the two V100s, CPU, RAM and disk" width="600">&nbsp;&nbsp;<img src="docs/img/lapilli-phone.png" alt="The chat page on a phone" width="178"></p>
+<p align="center"><img src="docs/img/lapilli-experts.png" alt="The Experts tab: every expert of the DeepSeek Coder, by where it lives and how often it is read" width="860"></p>
+<p align="center"><sub>The chat page and the same page on a phone, with the Qwen3.8-27B on one V100; the Monitor while an answer is written and
+the Experts tab with its 7,680 experts, with the DeepSeek Coder on two. Screenshots of this build.</sub></p>
 
-RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows. One code-agent prompt per length, 256 generated
-tokens, MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt).
+> Based on Basalt commit `6809edfa` (November 15, 2026), with a few later upstream pieces (the expert map's console, MIT).
+> Provided as is, without support (see [Support](#support)).
 
-### Prompt processing (tokens/s)
+## The three models
 
-| Model | 1K | 4K | 32K | 64K | 128K | 262K |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Q2_0** | 389 | 539 | 571 | 561 | 543 | 496 |
-| **IQ2_XS** | 332 | 463 | 495 | 486 | 472 | 437 |
-| **IQ3_XXS** | 285 | 410 | 435 | 427 | 414 | - |
+| | GPUs | Pack | Writing speed | Prompt reading | Quality against BF16 |
+|---|---|---|---|---|---|
+| **Qwen3.8-27B**<br><sub>dense, NVFP4</sub> | **1 × V100** | 21 GB, the official pack | **88** tokens/s with its drafter on a conversation, 186 on structured output | 697 tokens/s at 16K, 637 at 32K | KLD 0.02297, same top-1 93.37% |
+| **DeepSeek-V4.1-Flash Coder**<br><sub>192 experts, IQ2_XXS</sub> | 2 × V100 | 192 GB, converted (see below) | **98** tokens/s on code, 64 on prose, with its DSpark drafter | | no BF16 reference for this pack |
+| **Qwen3.8-Flash-Next**<br><sub>mixture of experts</sub> | 2 × V100 | 115 GB, `UD-Q4_K_XL` | **139** tokens/s on a long answer with reasoning, 91 on a short one | 1,172 tokens/s at 4K, 1,446 at 16K | KLD 0.04932, same top-1 92.75% |
 
-### Output (tokens/s)
+Measured on one machine: 2 × V100-SXM2 32 GB (on PCIe 3.0 x16 and x4 links, peer-to-peer off: see below), Intel Core
+i9-14900K, 96 GB of RAM, Windows 10, CUDA 12.6, NVIDIA driver 561.17, the packs on an NVMe SSD. Measured on November 23, 2026,
+with the build from this repository. Speeds measured through the server are the median of three runs; `basalt-bench`'s
+(the 27B) are its mean of three runs. Quality is Basalt's own gate
+(`basalt-bench --quality 100`: 100 chunks through the decode path, against the BF16 reference).
 
-| Model | 1K | 4K | 32K | 64K | 128K | 262K |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Q2_0** | 88.7 | 94.6 | 87.5 | 76.4 | 65.1 | 56.3 |
-| **IQ2_XS** | 82.0 | 78.0 | 65.3 | 63.7 | 52.0 | 48.0 |
-| **IQ3_XXS** | 64.6 | 65.6 | 57.3 | 54.4 | 44.8 | - |
+## Recommended models
 
-IQ3_XXS at 262K is not measured: with its 43 GB of experts, a 260K-token context brings a 64 GB PC to its memory
-limit. Use up to 128K with IQ3_XXS on 64 GB.
+The packs every figure above was measured with, and where to download them. Each pack has its own license on its Hugging
+Face page.
 
-Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32K, 4 minutes at 128K and 9 minutes at
-262K. The raw numbers: `bench/results/`. The [paper](docs/paper/Strata-Paper.pdf) explains every number.
+### Qwen3.8-27B, on one V100
 
-## Other GPUs (estimated)
+A dense model of 27 billion parameters: 64 layers (48 Gated DeltaNet, 16 gated attention), thinking and tools, a context of
+up to 262,144 tokens, and a DFlash 2 block drafter in the pack that writes several tokens at a time.
 
-Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
-part by how many more experts the card's VRAM holds. Treat as **±20%**. Numbers are *prompt / output* tokens/s.
+- **Pack**: `Qwen3.8-27B-QUASAR-NVFP4.basalt`, 21.1 GB: the official Basalt pack (NVFP4 weights, from QUASAR's checkpoint)
+- **Download**: [jesdga/Qwen3.8-27B-Basalt](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) · [direct link](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt/resolve/main/Qwen3.8-27B-QUASAR-NVFP4.basalt)
+- **Needs**: one V100 32 GB
 
-| GPU | Model | 1K | 4K | 32K | 64K | 128K | 262K |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| RTX 5060 Ti 16GB | Q2_0 | ~341 / ~80 | ~472 / ~87 | ~501 / ~81 | ~492 / ~72 | ~476 / ~62 | ~435 / ~53 |
-|  | IQ2_XS | ~291 / ~80 | ~406 / ~77 | ~434 / ~63 | ~426 / ~62 | ~413 / ~51 | ~383 / ~47 |
-|  | IQ3_XXS | ~249 / ~66 | ~359 / ~65 | ~381 / ~56 | ~374 / ~54 | ~363 / ~45 | - |
-| RTX 3090 24GB | Q2_0 | ~355 / ~128 | ~491 / ~140 | ~521 / ~130 | ~512 / ~115 | ~495 / ~100 | ~453 / ~85 |
-|  | IQ2_XS | ~303 / ~131 | ~422 / ~128 | ~451 / ~103 | ~444 / ~102 | ~430 / ~85 | ~398 / ~78 |
-|  | IQ3_XXS | ~260 / ~106 | ~374 / ~103 | ~396 / ~89 | ~390 / ~85 | ~378 / ~71 | - |
-
-More VRAM matters more than a faster GPU: every extra GB holds ~700 more experts, and every expert on the GPU is one the
-CPU does not have to compute. A 3090's 24 GB takes most of the CPU work away.
-
-## Which model?
-
-All three are [ISTA-DASLab's GSQ-RCO quantizations](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
-
-| Model | Download | RAM it uses | Speed | Quality |
-| --- | ---: | ---: | --- | --- |
-| **Q2_0** | 66 GB | ~34 GB experts + ~6 GB | fastest | good |
-| **IQ2_XS** | 68 GB | ~36 GB experts + ~6 GB | close to Q2_0 | a bit better |
-| **IQ3_XXS** | 76 GB | ~43 GB experts + ~6 GB | slower (more CPU work) | best |
-
-With 64 GB of RAM all three fit (close the browser for IQ3_XXS, and keep its context at 128K or less). With 48 GB only Q2_0 / IQ2_XS may fit. 32 GB is not enough.
-
-## Before you start
-
-You need **only an NVIDIA driver** (version 580 or newer; update it with the NVIDIA App or from
-[nvidia.com/drivers](https://www.nvidia.com/drivers)). Everything else is installed for you the first time.
-
-| | |
-| --- | --- |
-| GPU | NVIDIA **RTX 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070; RTX 30/40 are untested. |
-| RAM | **64 GB** recommended (see the table above). |
-| CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 (Ryzen 7000/9000) is a bit faster. |
-| Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
-| OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
-
-What the first start installs, all inside this folder (`.venv/`, `engine/`, `third_party/`, `models/`, `packs/`, `mtp/`):
-Python 3.12 if you have none (for your user account, no admin), a private Python environment, NVIDIA's CUDA libraries
-(from pip, ~0.4 GB), the ready-made Strata engine for RTX 30/40/50, the model and the MTP draft layer. If no
-ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
-Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
-
----
-
-## Windows
-
-### Double-click `START-HERE.bat`
-
-**The first time** it asks three questions and does the rest:
-
-1. **Which model?** Q2_0, IQ2_XS or IQ3_XXS (it recommends one for your RAM).
-2. **How much context?** 8K to 256K tokens (it recommends one for your VRAM).
-3. **Images?** yes / no (see [Images](#images-vision)).
-
-Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, a small
-page that shows it is running and lets you chat. The API is at `http://127.0.0.1:8080/v1` for your apps.
-
-**Every time after that**, `START-HERE.bat` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
-downloaded again. Closing the window stops the model.
-
-```
-START-HERE.bat --setup                          install another model, or change context / images
-START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
-START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
-START-HERE.bat --port 8081                      another port
+```bat
+hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-QUASAR-NVFP4.basalt --local-dir models
+bin\basalt.exe serve models\Qwen3.8-27B-QUASAR-NVFP4.basalt --gpu 0 --kv int8 --max-context 262144 --port 8080
 ```
 
-With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
+### DeepSeek-V4.1-Flash Coder, on two V100s
 
-### Chat in the terminal (optional)
+DeepSeek-V4.1-Flash is a mixture of experts: 40 layers of 384 experts, 6 chosen for each token plus a shared one.
+ISTA-DASLab's GSQ-RCO Coder is a version for code that keeps 192 of the 384 experts of each layer, in IQ2_XXS; Unsloth's DSpark
+drafter writes several tokens at a time. There is no ready-made Basalt pack for it: you build it from the GGUF files (about
+184 GB to download, 192 GB once built).
 
-```
-.venv\Scripts\python chat.py
-```
+- **Model**: [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) (revision `54229d38`): the five parts of `IQ2_XXS/` (72.1 GB), the Engram table `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` (110.6 GB) and `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` (1.0 GB)
+- **Drafter**: [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (revision `dfcee0ec`): `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` (8.0 GB)
+- **Needs**: two V100 32 GB, 96 GB of RAM with 20 GB kept free (its RAM tier is pinned), a fast NVMe SSD
 
----
+1. Put the five `IQ2_XXS` parts, the `mmproj` file and the Engram table in one folder, the Engram table renamed as the sixth
+   part: `DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00006-of-00006.gguf`.
+2. Convert, then add the drafter (the converter reads the GGUF files memory-mapped: about 10 minutes from an NVMe SSD), then
+   start the server:
 
-## Linux
-
-```bash
-./setup.sh
-```
-
-The same three questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile,
-for the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
-start the model directly. Options as on Windows (`./setup.sh --setup`, `--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`).
-Terminal chat: `.venv/bin/python chat.py`.
-
----
-
-## Using it
-
-The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or edit the run script).
-
-| API | Endpoint |
-| --- | --- |
-| OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
-| Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| Model list / health | `GET /v1/models`, `GET /health` |
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
+```bat
+.venv\Scripts\python tools\convert\convert.py --gguf <folder>\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf --mmproj <folder>\mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf --out models\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS.basalt
+.venv\Scripts\python tools\convert\convert.py --dspark dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf --into models\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS.basalt --undo-dir models\dspark-undo
+bin\basalt.exe serve models\DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS.basalt --gpu 0,1 --kv fp16 --vram-reserve-mib 700 --ram-reserve-mib 20480 --max-context 32768 --vision off --port 8080
 ```
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
-r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": "Hello!"}])
-print(r.choices[0].message.content)
+The finished pack is 192,059,655,012 bytes, in 14 sections. Its expert ranking for 192 experts, derived from the base model's
+by `tools/profiles/derive_pruned_profile.py`, is in `data/profiles/`. A V100 has no FP8: the cache is fp16.
+
+### Qwen3.8-Flash-Next, on two V100s
+
+A mixture of experts: 48 layers (36 Gated DeltaNet, 12 QSA attention) of 512 experts, 10 chosen for each token, an MTP drafter
+in the pack, and image input. The experts that do not fit in VRAM are read from RAM and from the SSD.
+
+- **Pack**: `Qwen3.8-FN-UD-Q4_K_XL.basalt`, 115 GB (K-quants: the NVFP4 packs of this model need FP4 hardware)
+- **Download**: [jesdga/Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) · [direct link](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt/resolve/main/Qwen3.8-FN-UD-Q4_K_XL.basalt)
+- **Needs**: two V100 32 GB, 96 GB of RAM, a fast NVMe SSD
+- **Smaller**: `Qwen3.8-FN-UD-IQ3_XXS.basalt` (87.6 GB, same page), run by a user on one V100 16 GB: see [the report](docs/community/v100-16gb-linux.md)
+
+```bat
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-UD-Q4_K_XL.basalt --local-dir models
+bin\basalt.exe serve models\Qwen3.8-FN-UD-Q4_K_XL.basalt --gpu 0,1 --kv int8 --mmap-experts --resident-experts --peer-exclusive --vram-reserve-mib 700 --ram-reserve-mib 16384 --max-context 262144 --vision dynamic --port 8080
 ```
 
-- **Thinking levels: none, low, medium, high.** The model thinks before it answers (streamed as
-  `reasoning_content`, Anthropic: `thinking` blocks). Choose how much per request - in the chat page (the "Thinking"
-  menu), in `chat.py` (`/think low`), or over the API:
+## Measured details
 
-  | API | how |
-  | --- | --- |
-  | OpenAI | `"reasoning_effort": "none" \| "low" \| "medium" \| "high"` (also `"reasoning": {"effort": ...}`, or `"chat_template_kwargs": {"enable_thinking": false}`) |
-  | Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, or `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high) |
+<details>
+<summary><b>Qwen3.8-27B on one V100</b></summary>
 
-  Without a setting the model uses its own default, **high**. `none` answers at once (fastest); `low` keeps the thinking
-  short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
-  think briefly, on hard ones `high` thinks longest and is most accurate.
-- **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
-- **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut.
-- **From other devices / the internet.** The server listens on your PC only (`127.0.0.1`). To reach it from elsewhere,
-  put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
-  `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
-  add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
-  clients then send it as their API key.
+A V100 has neither FP4 nor FP8 tensor cores. At load, the pack's NVFP4 planes become ggml's NVFP4 blocks in place and the
+FP8 head becomes Q8_0; the products run on the dp4a path and, for long prompts, on Volta's own tensor cores with the same
+bits. The activations stay in 8 bits, where Blackwell rounds them to 4.
 
-**Current limits (v1):** one request at a time; greedy decoding (temperature is ignored); every request processes its
-whole prompt again (no conversation cache yet, so long chats have a long time-to-first-token); images only when set up
-with them (below); no video.
+| | Lapilli, 1 × V100 | Basalt's figures on an RTX 5090 (int8 cache) |
+|---|---|---|
+| Perplexity (BF16: 6.7411) | 6.8304 | 6.826 |
+| Mean KLD | 0.02297 | 0.0259 |
+| Same top-1 token | 93.37% | 92.89% |
 
----
+| Writing (`basalt-bench -t conv,struct,prose`, seed 7) | conversation | structured | prose |
+|---|---|---|---|
+| With the DFlash 2 drafter (the default) | 88 | 186 | 66 |
+| Without a drafter (`--spec 0`) | 40 | 37 | 38 |
 
-## Images (vision)
+Prompt reading: 697 tokens/s at 16K tokens, 637 at 32K. Writing after a long prompt, without a drafter:
+33.2 tokens/s after 32K, 30.2 after 64K (`basalt-bench --depth-decode`). Tokens/s, in tokens of the answer.
 
-The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-(0.9 GB, a 27-layer ViT plus the projector into the language model). It is **optional**: say yes when the setup asks
-"Images?", or run it again with `--vision gpu` (or `--vision cpu`). The setup downloads the encoder, builds a small
-helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script. Nothing else changes.
+</details>
 
-| Encoder on | Time per picture | Cost |
-| --- | --- | --- |
-| **GPU** (recommended) | **0.1-0.5 s** (up to 1,024 image tokens) | ~1.4 GB of VRAM is kept free for it, so the expert cache is smaller: text output is a few % slower (table below) |
-| CPU | 10-30 s (pictures are scaled down to ~300 image tokens) | nothing on the GPU |
+<details>
+<summary><b>DeepSeek-V4.1-Flash Coder on two V100s</b></summary>
 
-A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300). The same picture sent again, as chat apps
-do on every turn, is encoded only once.
+Writing, greedy, through the server (the median of three runs after a warm-up): 98 tokens/s on code (a complete
+Python class, 512 tokens), 64 on prose (256 tokens), with the DSpark drafter. There is no BF16 reference for this
+pack, so no quality gate.
 
-### Sending a picture
+This model keeps a faster V100 layout for its Q5_K products, on by default for it alone: with it a row's bits depend on
+the width of its window, but its text already depends on where its experts live (on a card or in RAM), run to run.
+`BASALT_MULTI_V70=0` turns it off: 92 tokens/s on code, 62 on prose.
 
-**Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
+</details>
 
+<details>
+<summary><b>Qwen3.8-Flash-Next on two V100s</b></summary>
+
+| | Lapilli, 2 × V100 | Basalt's published figures for this pack (RTX 5090) |
+|---|---|---|
+| Perplexity | 3.3206 | 3.321 |
+| Mean KLD | 0.04932 | 0.0496 |
+| Same top-1 token | 92.75% | 92.63% |
+
+| | v0.5 | v0.4, same machine and runs |
+|---|---|---|
+| Writing, short answer (256 tokens, temperature 0) | 91 tokens/s | 90 tokens/s |
+| Writing, long answer with reasoning (1,500 tokens) | 139 tokens/s | 139 tokens/s |
+| Prompt reading, ~4,200 / ~8,000 / ~16,000 tokens | 1,172 / 1,503 / 1,446 tokens/s | |
+
+</details>
+
+124 of Basalt's 139 GPU parity tests pass on a V100. The others test paths a V100 does not take: Blackwell-only kernels
+(FP8, FP4, TMA), thread-block clusters (the engine uses its cluster-free fallback), more than 96 KB of shared memory per
+block, and three DeepSeek fingerprints recorded on Blackwell, whose bits add in another order on Volta (their numerical
+checks pass). For the 27B and the Flash-Next, every row of a product gives the same bits whatever the width of its
+window, so a drafter changes the speed, never the answer.
+
+## What's new in v0.5
+
+- **One engine for three models.** `-DBASALT_MODELS=qwen4exp;deepseek41;qwen35`; the server picks the model from the pack.
+  The Flash-Next computes exactly as in v0.4 (the same quality gate figures to the last digit).
+- **Qwen3.8-27B on a single V100** (the official NVFP4 pack): every product on MMQ's dp4a path, a decode kernel for the
+  drafter's windows (`dense_mmvq`, bit for bit the reference path at every window width), the steps around the products fused.
+- **DeepSeek-V4.1-Flash Coder on two V100s**: the indexer kernels on sm_70, products laid out for Volta, the DSpark drafter.
+- **Volta's own tensor cores**: the long-prompt products on `mma.m8n8k4` with the dp4a path's exact bits (+48% prompt reading
+  at 16K, +65% at 32K on the 27B), the prompt attention and a one-pass decode attention on WMMA.
+- **The Monitor in five sections** (Overview, Requests, Slots, Hardware, Logs) and an **Experts tab**: every expert drawn by
+  where it lives (VRAM, the second card, RAM, the file) and how often it is read. From upstream Basalt's console (MIT).
+- **The chat page**: the maximum length goes up to the model's context; a phone-sized Monitor.
+- **`basalt-bench --depth-decode N`**: the writing speed after each long prompt.
+
+The previous release, [v0.4.0-v100.1](https://github.com/chris83-dev/lapilli-v100/releases/tag/v0.4.0-v100.1) (the Flash-Next
+only), stays available.
+
+## Tested by the community
+
+People tested Lapilli on their own machines and shared everything. Their figures, as they reported them:
+
+| | Machine | What they ran | Their results |
+|---|---|---|---|
+| **[nebod99](docs/community/one-v100-pcie-linux.md)** | 1 × V100 PCIe 32 GB, Linux (CUDA 12.6.3 in Docker), i9-10940X, 96 GB | v0.4, Qwen3.8-Flash-Next `IQ3_S`, a 7,242-token prompt, thinking on | **100.9 tokens/s** at 128K context (Strata: 55.6), first token **8.7 s** (22.6); on 2,500+ questions, the same quality as Strata |
+| **[ildargiv](docs/community/v100-16gb-linux.md)** | 1 × V100-SXM2 **16 GB**, Ubuntu 22.04, Ryzen 5 5600G, 96 GB | v0.4, Qwen3.8-Flash-Next `IQ3_XXS`, the first 16 GB card | **67.8 / 76.0 / 70.4 tokens/s** writing after 1K / 8K / 32K prompts; prompt reading 497 / 1,033 / 1,174 tokens/s; a stable 16 GB setup |
+| **[Csavoldi](docs/community/inkling2-mini.md)** | 2 × V100 PCIe 32 GB, one in use | **Inkling 2 Mini** ported onto Lapilli: upstream Basalt v0.5.5 merged with the Volta paths | **69 tokens/s** writing (60.5 at 42K, 44.4 at 165K); prompt 850 tokens/s; 512K context; 5/5 top-1 against llama.cpp |
+
+Thank you, nebod99, ildargiv and Csavoldi. Lapilli had only ever run on one machine; you took it to Linux, to a single card,
+to a 16 GB V100 and to a new model, measured carefully and wrote down what others need to do the same. Every V100 owner
+benefits from your work.
+
+## Quick start (Windows)
+
+1. Download `lapilli-v100-v0.5.0-v100.1-windows-x64.zip` from the [releases](https://github.com/chris83-dev/lapilli-v100/releases)
+   and unzip it. It holds `bin\` (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`), the server, the chat page,
+   `data\`, `docs\`, `requirements.txt` and the licences, built for the three models; like Basalt's archives, no CUDA
+   libraries and no Python environment.
+2. Install an NVIDIA driver that supports CUDA 12.6 (tested: 561.17), the CUDA 12 runtime libraries on the `PATH`
+   (`cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`: the CUDA Toolkit 12.6 to 12.9 installs them) and the Microsoft
+   Visual C++ 2015-2022 Redistributable (x64).
+3. Create the Python environment at the archive's top directory: `py -3 -m venv .venv` then
+   `.venv\Scripts\pip install -r requirements.txt`.
+4. Download a pack and start the server with its command (see [Recommended models](#recommended-models)), then open
+   `http://127.0.0.1:8080/`.
+
+## Requirements
+
+- One or more NVIDIA V100 GPUs: one 32 GB card for the 27B, two for the DeepSeek Coder and for the Flash-Next as measured.
+  Tested by users: one V100 PCIe 32 GB and one V100-SXM2 16 GB with the Flash-Next (see [Tested by the community](#tested-by-the-community)).
+- Windows 10 or 11 x64, or Linux (run by users with CUDA 12.6.3 in Docker and on Ubuntu 22.04; the build steps below are for
+  Windows).
+- CUDA Toolkit 12.6 to 12.9 (CUDA 13 dropped Volta), the Visual Studio 2022 Build Tools (C++), CMake 3.24+, Python 3.10+.
+- System RAM and a fast SSD for the experts that do not fit in VRAM. Tested with 96 GB of RAM.
+
+## Build
+
+From an *x64 Native Tools Command Prompt for VS 2022*:
+
+```bat
+git clone https://github.com/chris83-dev/lapilli-v100 lapilli && cd lapilli
+cmake -S . -B build70 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 "-DBASALT_MODELS=qwen4exp;deepseek41;qwen35" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+cmake --build build70
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
-you> /image C:\Users\me\Pictures\receipt.jpg
-(picture attached: receipt.jpg - now type your question)
-you> What is the total on this receipt?
-```
 
-**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path):
+The executables land in `bin\`. A full build of the three models, tests included, took 48 minutes on a 24-core i9-14900K with 6 parallel jobs. `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared` avoids a duplicate `cudart` at link time
+on Windows. `-DBUILD_TESTING=ON` adds the parity tests (`ctest --test-dir build70 -L gpu`). On Linux, users built it with the
+same CMake options (see their reports).
 
-```python
-import base64
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
-img = base64.b64encode(open("photo.jpg", "rb").read()).decode()
-r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": [
-    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}},
-    {"type": "text", "text": "What is in this picture?"}]}])
-print(r.choices[0].message.content)
-```
+## What changed from Basalt
 
-**Anthropic API:** an `image` block with a `base64` (or `url`) source, as usual.
+- **Build**: compute capability 7.0 is accepted next to 12.0, with CUDA 12.6 or newer.
+- **A compatibility layer** (`include/basalt/kernels/volta_compat.cuh`): every newer PTX instruction the engine uses
+  (`cp.async`, `ldmatrix`, the `mma` shapes of Turing and Ampere, tf32 and bf16 conversions, `griddepcontrol`, clusters) gets
+  a correct sm_70 equivalent, so every kernel compiles and runs right on a V100.
+- **V100 paths for the hot kernels**: llama.cpp's dp4a path for the quantized prompt products, and their NVFP4 version on
+  Volta's tensor cores with the same bits; int8 prompt attention on the V100 tensor cores (`mma.m8n8k4`, from Strata); the 27B's
+  attention on WMMA; hyper-connection reads, the router, the decode experts and the GDN recurrence rewritten for Volta; the
+  DeepSeek indexer without clusters; the expert exchange between two cards tuned for V100.
+- **Peer-to-peer access is off by default on Volta**: on the test machine, direct copies between the two V100s returned wrong
+  data. The copies go through the host instead. `BASALT_PEER_NO_P2P=0` turns peer access back on, at your own risk.
+- **Server**: the exact resume of a follow-up turn; the expert map and the slots' figures on `/metrics` and `/slots`; a
+  request's `fit_max_tokens: true` cuts its `max_tokens` to the room the context leaves.
+- **The Lapilli chat page** at `/`; Basalt's dashboard at `/dashboard`.
 
-JPEG, PNG, BMP and GIF work (WebP does not). Chat apps with image upload work the same way.
+The `BASALT_*` environment variables added by the port are the A/B switches used while measuring it; their defaults are the
+best measured on V100, and they are not meant as settings. Three may help: `BASALT_MMQ_HMMA=0` and `BASALT_ATTN_PROMPT=i8`
+put the prompt products and the prompt attention back on their v0.4 paths if a new path misbehaves on your card;
+`BASALT_MULTI_V70=0` turns off the DeepSeek's faster Q5_K layout (and `auto` turns it on for the other models).
 
-### Speed with images on (4K context, measured)
+## Not tested
 
-| Model | Prompt tok/s, images off | Prompt tok/s, images on | Output tok/s, images off | Output tok/s, images on |
-| --- | ---: | ---: | ---: | ---: |
-| **Q2_0** | 541 | 531 | 90.7 | 86.9 |
-| **IQ2_XS** | 468 | 458 | 77.1 | 74.0 |
-| **IQ3_XXS** | 411 | 401 | 64.7 | 59.5 |
+NVLink with peer access on; the DeepSeek Coder and the 27B on Linux; packs other than those above (and `IQ3_S`, `IQ3_XXS` of
+the Flash-Next, run by users); Blackwell builds of this fork.
 
-"Off" is the published setup; "on" runs with the encoder loaded on the GPU and its VRAM kept free, so ~1,000 fewer
-experts fit in VRAM and the CPU computes a few more per token: 2-8% slower. For text, turning images on changes
-nothing else (the output is bit-identical when the VRAM is the same).
+## Support
 
-A question about a picture (a 640x480 newspaper page = 300 image tokens, a 328-token prompt; the whole request, encoder
-on the GPU, measured through the API):
+This fork is shared as is, in the hope that it helps other V100 owners. There is no promise of support or updates. Issues
+may be read, but may not get an answer.
 
-| Model | Answer ("MEN WALK ON MOON") | Picture encoded | Prompt | Output |
-| --- | ---: | ---: | ---: | ---: |
-| **Q2_0** | 1.9 s | ~0.1 s | 207 tok/s | 65-73 tok/s |
-| **IQ2_XS** | 2.3 s | ~0.1 s | 173 tok/s | 50-60 tok/s |
-| **IQ3_XXS** | 2.7 s | ~0.1 s | 144 tok/s | 41-50 tok/s |
+## Credits and license
 
-(Short prompts run below the 4K prompt speed: a 2,048-token chunk is where the prompt path is efficient. Short answers
-run below the long-output speed: the first rounds have no draft yet.)
+MIT, like Basalt ([LICENSE](LICENSE)). Lapilli stands on the work of others:
 
-**How it works inside:** the encoder turns the picture into rows of the same width as the model's word embeddings;
-Strata puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the
-picture; the model uses interleaved M-RoPE). Answers match llama.cpp's multimodal implementation token for token on our
-test images.
+- [Basalt](https://github.com/jesdga95/basalt) by Jesús Gulfo (MIT): the engine, its three models and the expert map's console.
+- [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors (MIT): Basalt's origin, and the V100
+  prompt-attention kernel used here.
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the dp4a prompt products.
+- The models' authors, and the packs: [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) (the 192-expert Coder),
+  [Unsloth](https://huggingface.co/unsloth) (the DSpark drafter in GGUF), jesdga (the Basalt packs).
+- [marked](https://github.com/markedjs/marked) (MIT): the chat page's text formatting. Geist font (SIL Open Font License).
 
----
+Every notice is in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES). Basalt's own README, with its models and documentation, is at
+[github.com/jesdga95/basalt](https://github.com/jesdga95/basalt); this repository's `docs/` is Basalt's documentation, written
+for Blackwell.
 
-## Troubleshooting
-
-| Symptom | What to do |
-| --- | --- |
-| `the NVIDIA driver is too old` | Update the driver (NVIDIA App or nvidia.com/drivers), restart, run `START-HERE.bat` again. |
-| Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
-| `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
-| `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
-| The first start takes minutes | It is reading 34-43 GB into RAM; the second start is faster while the files are in the OS cache. |
-| Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
-| `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
-| Slower than the tables | The monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM running below its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half. |
-| `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
-| A picture is refused or `cannot read the image` | Use JPEG, PNG, BMP or GIF (not WebP). |
-| Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
-| Anything else | The engine log is `strata-<model>.log` in this folder. |
-
----
-
-## How it works
-
-<p align="center"><img src="docs/paper/tiers.svg" width="760" alt="memory tiers"></p>
-
-- **GPU (VRAM):** attention and DeltaNet mixers, the gated-residual weights, routers, shared experts, output head, the MTP
-  draft layer, the KV cache, and an **expert cache** that fills the rest of VRAM with the most-used experts (it adapts to
-  the conversation while you chat).
-- **RAM:** all 24,576 experts, pinned. The CPU computes the experts that are not on the GPU **in place**, at the same time
-  as the GPU works on the cached ones (AVX-512 / AVX2 kernels, ggml's for the i-quants).
-- **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
-- **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them. 2.4-3.2
-  tokens per pass on average.
-- **Prompts** are processed in 2,048-token chunks with the experts streamed to the GPU over PCIe.
-
-The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](docs/paper/Strata-Paper.pdf)**.
-
----
-
-## Credits and licenses
-
-- Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
-  [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
-  Their licenses apply to the weights.
-- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and
-  dequantizers transcribed in `src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, the
-  `mtmd` library behind the image encoder (`tools/vision/`), and `gguf-py` used by the tools. See
-  `third_party/ggml/LICENSE`.
-- Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
+French: [README.fr.md](README.fr.md).

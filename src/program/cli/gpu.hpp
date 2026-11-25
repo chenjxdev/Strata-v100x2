@@ -1,0 +1,14 @@
+#pragma once
+
+#include <optional>
+#include <vector>
+#include "basalt/program/gpu_select.hpp"
+
+namespace basalt::program { struct CommonOptions; }
+
+namespace basalt::program::cli {
+
+// An exit code for --gpu-plan or a failed choice; otherwise selected cards and roles are applied.
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers, bool prompt_line = false);
+
+}  // namespace basalt::program::cli
